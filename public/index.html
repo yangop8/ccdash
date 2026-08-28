@@ -7,20 +7,77 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
+    /* Light is the default so the page is readable before any media query
+       matches; dark below restores the original terminal palette verbatim.
+       The neon status colours only work on a dark ground — on white they run
+       1.3:1 to 3.4:1 against WCAG's 4.5:1, so light gets its own set. */
     :root {
-      --bg: #0a0e14;
-      --bg-card: #111820;
-      --bg-card-hover: #161d27;
-      --border: #1e2a3a;
-      --text: #c5cdd8;
-      --text-dim: #5c6a7a;
-      --text-bright: #e8edf3;
-      --green: #00ff88;
-      --yellow: #ffcc00;
-      --red: #ff4444;
-      --grey: #555;
-      --blue: #4dabf7;
-      --bar-bg: #1a2332;
+      color-scheme: light dark;
+
+      --bg: #f4f6f8;
+      --bg-card: #ffffff;
+      --bg-card-hover: #eef1f5;
+      --border: #d8dee6;
+      --text: #2b3440;
+      --text-dim: #626c79;
+      --text-bright: #11161d;
+      --green: #00794a;
+      --yellow: #855d00;
+      --red: #c62828;
+      --orange: #a85400;
+      --grey: #656b78;
+      --blue: #1565c0;
+      --bar-bg: #e6eaef;
+
+      /* Chip and badge fills. Light needs more alpha: a 10% wash that reads
+         clearly against #0a0e14 disappears against white. */
+      --tint-green: rgba(0,121,74,0.10);
+      --tint-green-strong: rgba(0,121,74,0.30);
+      --tint-blue: rgba(21,101,192,0.10);
+      --tint-yellow: rgba(138,97,0,0.12);
+      --tint-yellow-strong: rgba(138,97,0,0.16);
+      --tint-red: rgba(198,40,40,0.10);
+      --tint-red-strong: rgba(198,40,40,0.14);
+      --tint-grey: rgba(107,114,128,0.12);
+      --tint-dim: rgba(102,112,126,0.12);
+      --tint-stale: rgba(216,222,230,0.55);
+
+      --stale-opacity: 0.5;
+      /* The card is already faded; the chip need not vanish as well. */
+      --stale-chip-fg: #656b78;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0a0e14;
+        --bg-card: #111820;
+        --bg-card-hover: #161d27;
+        --border: #1e2a3a;
+        --text: #c5cdd8;
+        --text-dim: #5c6a7a;
+        --text-bright: #e8edf3;
+        --green: #00ff88;
+        --yellow: #ffcc00;
+        --red: #ff4444;
+        --orange: #ff8800;
+        --grey: #555;
+        --blue: #4dabf7;
+        --bar-bg: #1a2332;
+
+        --tint-green: rgba(0,255,136,0.10);
+        --tint-green-strong: rgba(0,255,136,0.25);
+        --tint-blue: rgba(77,171,247,0.12);
+        --tint-yellow: rgba(255,204,0,0.10);
+        --tint-yellow-strong: rgba(255,204,0,0.12);
+        --tint-red: rgba(255,68,68,0.10);
+        --tint-red-strong: rgba(255,68,68,0.15);
+        --tint-grey: rgba(85,85,85,0.10);
+        --tint-dim: rgba(92,106,122,0.12);
+        --tint-stale: rgba(30,42,58,0.30);
+
+        --stale-opacity: 0.35;
+        --stale-chip-fg: #1e2a3a;
+      }
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -92,8 +149,8 @@
     .card.status-running  { border-left: 3px solid var(--blue); }
     .card.status-waiting  { border-left: 3px solid var(--yellow); }
     .card.status-error    { border-left: 3px solid var(--red); }
-    .card.status-idle     { border-left: 3px solid #ff8800; opacity: 0.7; }
-    .card.status-idle-stale { border-left: 3px solid var(--border); opacity: 0.35; }
+    .card.status-idle     { border-left: 3px solid var(--orange); opacity: 0.7; }
+    .card.status-idle-stale { border-left: 3px solid var(--border); opacity: var(--stale-opacity); }
 
     .card-header {
       display: flex;
@@ -129,17 +186,17 @@
       border-radius: 4px;
       font-weight: 500;
     }
-    .card-status.thinking { color: var(--green); background: rgba(0,255,136,0.1); }
-    .card-status.running  { color: var(--blue); background: rgba(77,171,247,0.12); }
-    .card-status.waiting  { color: var(--yellow); background: rgba(255,204,0,0.1); }
+    .card-status.thinking { color: var(--green); background: var(--tint-green); }
+    .card-status.running  { color: var(--blue); background: var(--tint-blue); }
+    .card-status.waiting  { color: var(--yellow); background: var(--tint-yellow); }
     /* Already looked at: still waiting, but no longer asking for attention. */
-    .card-status.waiting.seen { color: var(--text-dim); background: rgba(92,106,122,0.12); }
+    .card-status.waiting.seen { color: var(--text-dim); background: var(--tint-dim); }
     .card.status-waiting.seen { border-left-color: var(--text-dim); opacity: 0.6; }
     .status-dot.waiting.seen { background: var(--text-dim); animation: none; }
     .seen-tick { margin-right: 4px; opacity: 0.9; }
-    .card-status.error    { color: var(--red); background: rgba(255,68,68,0.1); }
-    .card-status.idle     { color: var(--grey); background: rgba(85,85,85,0.1); }
-    .card-status.idle-stale { color: var(--border); background: rgba(30,42,58,0.3); }
+    .card-status.error    { color: var(--red); background: var(--tint-red); }
+    .card-status.idle     { color: var(--grey); background: var(--tint-grey); }
+    .card-status.idle-stale { color: var(--stale-chip-fg); background: var(--tint-stale); }
 
     .perm-badge {
       font-size: 10px;
@@ -148,8 +205,8 @@
       font-weight: 500;
       letter-spacing: 0.3px;
     }
-    .perm-badge.bypass { color: var(--red); background: rgba(255,68,68,0.15); }
-    .perm-badge.accept-edits { color: var(--yellow); background: rgba(255,204,0,0.12); }
+    .perm-badge.bypass { color: var(--red); background: var(--tint-red-strong); }
+    .perm-badge.accept-edits { color: var(--yellow); background: var(--tint-yellow-strong); }
 
     .live-badge {
       font-size: 9px;
@@ -158,8 +215,8 @@
       font-weight: 600;
       letter-spacing: 0.4px;
       color: var(--green);
-      background: rgba(0,255,136,0.10);
-      border: 1px solid rgba(0,255,136,0.25);
+      background: var(--tint-green);
+      border: 1px solid var(--tint-green-strong);
     }
     .card-label { transition: color 0.15s; }
     .card-label.is-live:hover { color: var(--green); }
