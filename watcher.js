@@ -365,7 +365,15 @@ function processFile(filePath) {
   const offset = fileOffsets.get(filePath) || 0;
   if (stat.size <= offset) return;
 
-  const projectHash = path.basename(path.dirname(filePath));
+  // The project folder is the first segment under the watch root. Using the
+  // parent directory instead breaks on subagent logs, which sit at
+  // <hash>/<sessionId>/subagents/agent-*.jsonl and carry the parent's
+  // sessionId — they would stamp every such session with 'subagents' and
+  // make it unmatchable against any running process.
+  const rel = path.relative(WATCH_DIR, filePath);
+  const projectHash = (rel && !rel.startsWith('..'))
+    ? rel.split(path.sep)[0]
+    : path.basename(path.dirname(filePath));
   const stream = fs.createReadStream(filePath, { start: offset, encoding: 'utf8' });
   let buffer = '';
 
@@ -528,39 +536,52 @@ function scanLiveClaudeProcs(force) {
   return byHash;
 }
 
-// sessionId -> { tty, terminal, pid }
-// When a project has several running processes, the most recently active
-// sessions take them in order — one process per session.
+// sessionId -> { tty, terminal, pid, startedMs, busy, busyReason }
+//
+// A process is tied to a session by working directory, in two passes. The
+// exact match comes first: a session resumed from a subdirectory keeps writing
+// to the project folder it was first created in, so its folder name no longer
+// encodes where it runs, and matching on the folder alone loses it. The folder
+// encoding is the fallback, and still the only thing that works for a session
+// whose recorded cwd has since moved.
+//
+// One process per session either way: where several could match, the most
+// recently active takes it.
 function resolveLiveSessions(force) {
   const byHash = scanLiveClaudeProcs(force);
   const live = new Map();
   if (!byHash.size) return live;
 
-  const grouped = new Map();
-  for (const s of sessions.values()) {
-    if (!byHash.has(s.projectHash)) continue;
-    if (!grouped.has(s.projectHash)) grouped.set(s.projectHash, []);
-    grouped.get(s.projectHash).push(s);
-  }
-  for (const [hash, procList] of byHash) {
-    const candidates = (grouped.get(hash) || [])
-      .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0));
-    procList.forEach((proc, i) => {
-      const s = candidates[i];
-      if (!s) return;
-      // Subagents and workflow agents run in-process, so they spawn no shell —
-      // their JSONL traffic is the only sign they are alive.
-      const subagentDir = path.join(WATCH_DIR, s.projectHash, s.sessionId, 'subagents');
-      const busySubagents = hasRecentJsonl(subagentDir, SUBAGENT_ACTIVE_MS);
-      live.set(s.sessionId, {
-        tty: proc.tty,
-        terminal: proc.terminal,
-        pid: Number(proc.pid),
-        startedMs: proc.startedMs,
-        busy: proc.busyShell || busySubagents,
-        busyReason: proc.busyShell ? 'shell' : (busySubagents ? 'subagents' : null),
-      });
+  const procs = [];
+  for (const list of byHash.values()) for (const proc of list) procs.push(proc);
+
+  const byRecency = [...sessions.values()]
+    .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0));
+  const taken = new Set();
+
+  function claim(proc, matches) {
+    const s = byRecency.find(x => !taken.has(x.sessionId) && matches(x));
+    if (!s) return false;
+    taken.add(s.sessionId);
+    // Subagents and workflow agents run in-process, so they spawn no shell —
+    // their JSONL traffic is the only sign they are alive.
+    const subagentDir = path.join(WATCH_DIR, s.projectHash, s.sessionId, 'subagents');
+    const busySubagents = hasRecentJsonl(subagentDir, SUBAGENT_ACTIVE_MS);
+    live.set(s.sessionId, {
+      tty: proc.tty,
+      terminal: proc.terminal,
+      pid: Number(proc.pid),
+      startedMs: proc.startedMs,
+      busy: proc.busyShell || busySubagents,
+      busyReason: proc.busyShell ? 'shell' : (busySubagents ? 'subagents' : null),
     });
+    return true;
+  }
+
+  const unmatched = procs.filter(proc => !claim(proc, s => s.cwd === proc.cwd));
+  for (const proc of unmatched) {
+    const hash = encodeProjectHash(proc.cwd);
+    claim(proc, s => s.projectHash === hash);
   }
   return live;
 }
