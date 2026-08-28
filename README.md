@@ -1,87 +1,125 @@
-# Claude Code Dashboard
+# ccdash
 
-A lightweight localhost dashboard that monitors multiple Claude Code sessions in real-time. See token usage, costs, active tools, subagents, and session status across all your terminal instances at a glance.
+A localhost dashboard for running several Claude Code sessions at once. It answers one
+question at a glance — **which session needs me right now** — and gets you there in one
+click.
 
-![Claude Code Dashboard screenshot](Screenshot.png)
+![ccdash screenshot](Screenshot.png)
 
-## Why?
+> The screenshot predates the status and jump work below; it shows the original layout.
 
-Claude Code has no cross-session visibility. If you're running two or more sessions in separate terminals, you have to alt-tab to check status, there's no combined token/cost view, and you can't see which session is active vs idle.
+## Why
 
-This dashboard fixes that.
+Claude Code has no cross-session visibility. Running three or four sessions in separate
+terminals means alt-tabbing to find out what each one is doing, no combined token or cost
+view, and no way to tell a session that is working from one that has been sitting there
+waiting for you since lunch.
 
-## Features
+## What it does
 
-- **Live session monitoring** — auto-detects all Claude Code sessions
-- **Token and cost tracking** — per-session and combined totals, with correct per-model pricing
-- **Status detection** — thinking (green), waiting (yellow), idle (grey/orange), stale (dimmed)
-- **Context window usage** — visual progress bar per session
-- **Active subagents** — see spawned subagents while they're running
-- **Active files** — see which files each session is working on
-- **Recent log feed** — expandable per-session activity log
-- **Click to open** — click a project name to open its folder
-- **Git branch display** — see which branch each session is on
-- **Permission mode badges** — YOLO and AUTO-EDIT indicators
-- **Cross-platform** — Windows, macOS, and Linux
+- **Status that reflects the conversation, not the clock** — `thinking`, `running`,
+  `waiting`, `idle`, derived from where the exchange actually stopped
+- **Click a session to jump to its terminal** — raises the window it is running in
+  (iTerm2 and Terminal), or opens its folder when it is no longer running
+- **Read marks** — a session you have already opened stops competing for attention until
+  it actually moves
+- **Token and cost tracking** — per-session and combined, with per-model pricing and
+  correct cache accounting
+- **Context window usage** — per-model, so the bar means something
+- **Live subagent and background-job detection** — sessions doing delegated work read as
+  `running` rather than idle
+- **Active files, git branch, permission mode**, and an expandable per-session log
 
-## Quick Start
+## Quick start
 
 ```bash
-git clone https://github.com/Stargx/claude-code-dashboard.git
-cd claude-code-dashboard
+git clone https://github.com/yangop8/ccdash.git
+cd ccdash
 npm install
 npm start
 ```
 
-Open **http://localhost:3001** in your browser.
+Open **http://localhost:3001**. Run it in its own terminal tab; your Claude Code sessions
+run wherever they normally do.
 
-That's it. The dashboard will automatically detect any running Claude Code sessions.
+## How it works
 
-Run this in a separate terminal tab — your Claude Code sessions run in their own terminals as normal, and the dashboard monitors them all from one place.
+Claude Code writes JSONL session logs to `~/.claude/projects/`. ccdash watches them with
+`chokidar`, parses newly appended lines, and serves aggregated state over Express to a page
+that polls every 2 seconds. No WebSockets, no build step, no cloud.
 
-## How It Works
+Two things are read from outside those logs, because the logs do not contain them:
 
-Claude Code writes JSONL session logs to `~/.claude/projects/`. The dashboard:
+- **Liveness** comes from the process table. Claude Code does not hold its JSONL open, and
+  the per-session directories under `/tmp` outlive the process by weeks, so a running
+  `claude` process whose working directory matches the session's project is the only
+  reliable signal.
+- **The terminal window** comes from that process's controlling tty, matched against the
+  terminal's own window list over AppleScript.
 
-1. **Watches** those files for changes using `chokidar`
-2. **Parses** new lines as they're appended (tail behaviour)
-3. **Serves** aggregated session state via a simple Express API
-4. **Renders** a polling dashboard that refreshes every 2 seconds
+### Status model
 
-No WebSockets, no build step, no cloud services. Just a Node.js process reading local files.
+| Status | Meaning |
+|---|---|
+| `thinking` | The agent owes a response — a prompt to answer, a tool result to digest, a tool still running |
+| `running` | Delegated work is in flight: a shell older than 30s, or subagent traffic |
+| `waiting` | The turn is finished and the process is alive — it is blocked on you |
+| `idle` | The process is gone |
+
+Only an assistant message that says something and calls nothing hands control back, so
+that is the one shape that produces `waiting`. Elapsed time is not used: measured gaps
+between a prompt and the first assistant event run past 25 seconds, and any timeout short
+enough to be useful mislabels a working agent as done.
+
+**Known gap:** permission prompts are never written to the JSONL, so an unanswered one is
+indistinguishable from a running tool and reads as `thinking`. Tools that block on a human
+by name — `AskUserQuestion`, `ExitPlanMode` — are detected and read as `waiting`.
 
 ## Requirements
 
-- **Node.js** (v18 or later)
-- **Claude Code** (any version that writes JSONL session logs)
+- **Node.js** v18+
+- **Claude Code**
+- **macOS** for the click-to-jump feature (iTerm2 or Terminal). Everything else is
+  cross-platform; on other terminals and platforms a click opens the session folder.
 
 ## Configuration
-
-The dashboard runs on port 3001 by default. To change it, set the `PORT` environment variable:
 
 ```bash
 PORT=8080 npm start
 ```
 
-## Pricing
-
-Token costs are calculated using current Anthropic pricing. The pricing constants are in `watcher.js` — update them if pricing changes:
+Pricing and context windows live at the top of `watcher.js`. Both are per-model — update
+them when Anthropic's rates change:
 
 ```js
 const PRICING = {
-  "claude-sonnet-4-20250514": { input: 3.00, output: 15.00 },
-  "claude-opus-4-20250514":   { input: 15.00, output: 75.00 },
-  // ... per 1M tokens
+  'claude-opus-5': { input: 5.00, output: 25.00 },  // USD per 1M tokens
+  // ...
 };
 ```
 
-## Tech Stack
+Cache tokens are billed separately: writes at 1.25x the input rate, reads at 0.1x.
 
-- **Backend**: Node.js, Express, chokidar
-- **Frontend**: Single HTML file, React via CDN, no build step
-- **Styling**: Dark terminal aesthetic, IBM Plex Mono
-- **Dependencies**: 2 production packages (`express`, `chokidar`)
+### Auto-start
+
+A macOS LaunchAgent works, but only if the checkout lives **outside** `~/Desktop`,
+`~/Documents`, and `~/Downloads`. Those are TCC-protected, and a background agent that
+touches them blocks forever in `open()` with no error and no prompt — Node walks up the
+directory tree looking for `package.json` before it runs a line of your code, so the hang
+happens at startup.
+
+## Tech stack
+
+Node.js, Express, chokidar. Single HTML file, React via CDN, no build step. Two production
+dependencies.
+
+## Credits
+
+Built on [claude-code-dashboard](https://github.com/Stargx/claude-code-dashboard) by Cold
+Beam Games, which established the watcher/API/polling-page architecture and the terminal
+aesthetic. ccdash is an independent continuation: it adds the terminal jump, rewrites
+status derivation, adds read marks, and corrects context-window and cost accounting.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). The original copyright notice is retained.
