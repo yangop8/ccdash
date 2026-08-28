@@ -46,6 +46,10 @@ function getOrCreateSession(sessionId) {
       lastEventAt: null,
       lastEventType: '',
       lastContentTypes: [],
+      lastTurnType: '',        // 'user' | 'assistant' — main conversation only
+      lastTurnContentTypes: [],
+      lastTurnTools: [],
+      lastTurnAt: null,
       lastTurnInputTotal: 0, // input + cache for context window estimate
       permissionMode: '',
       version: '',
@@ -109,6 +113,18 @@ function processEvent(event, projectHash) {
     ? content.map(c => c.type)
     : (typeof content === 'string' ? ['text'] : []);
   session.lastContentTypes = contentTypes;
+
+  // Turn state must ignore the noise: 'attachment' and 'system' events fire
+  // constantly (thousands per session) and would otherwise overwrite the last
+  // real exchange, and sidechain events belong to subagents, not this turn.
+  if (!event.isSidechain && (event.type === 'user' || event.type === 'assistant')) {
+    session.lastTurnType = event.type;
+    session.lastTurnContentTypes = contentTypes;
+    session.lastTurnTools = Array.isArray(content)
+      ? content.filter(c => c.type === 'tool_use').map(c => c.name).filter(Boolean)
+      : [];
+    session.lastTurnAt = ts;
+  }
 
   if (event.type === 'assistant' && msg.usage) {
     const msgId = msg.id;
@@ -208,27 +224,58 @@ function processEvent(event, projectHash) {
   }
 }
 
-function deriveStatus(session) {
-  if (!session.lastEventAt) return 'idle';
+// 'idle' used to mean two very different things: waiting for you, and gone.
+// Now that liveness is known, a session with a running process is never idle —
+// it has finished its turn and is waiting for input.
+// Status comes from where the conversation stopped, not from how long ago.
+// Thinking gaps of 20-30s are normal, so any elapsed-time window mislabels a
+// working agent as done.
+//
+// The only shape that hands control back to the human is an assistant message
+// that says something and calls nothing. Everything else mid-turn — a human
+// prompt, a tool_result still to digest, a tool_use still running — means the
+// agent owes a response.
+//
+// Known gap: an unanswered permission prompt looks exactly like a running
+// tool. Claude Code does not write permission requests to the JSONL, so it is
+// reported as 'thinking'. Tools that block on the human *are* named in the
+// log, so those are caught — see BLOCKING_TOOLS.
+// These tools hand control to the human and block until answered. Unlike a
+// permission prompt they are ordinary tool_use blocks, so the log names them.
+const BLOCKING_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
+
+function deriveStatus(session, liveInfo) {
+  const isLive = !!liveInfo;
+  const resting = isLive ? 'waiting' : 'idle';
+  if (!session.lastEventAt) return resting;
+
   const elapsed = Date.now() - new Date(session.lastEventAt).getTime();
-
-  if (elapsed > 60_000) return 'idle';
-
-  // Check for error in recent log
-  const lastLogs = session.recentLog.slice(-3);
-  if (lastLogs.some(l => l.type === 'error')) return 'error';
-
-  if (elapsed < 15_000) {
-    if (session.lastEventType === 'assistant') {
-      if (session.lastContentTypes.includes('tool_use')) return 'thinking';
-      if (session.lastContentTypes.includes('text')) return 'waiting';
-      if (session.lastContentTypes.includes('thinking')) return 'thinking';
-    }
-    if (session.lastEventType === 'progress') return 'thinking';
-    if (session.lastEventType === 'user') return 'thinking'; // just sent input, waiting for response
+  if (elapsed < 60_000 && session.recentLog.slice(-3).some(l => l.type === 'error')) {
+    return 'error';
   }
 
-  return 'idle';
+  // An explicit question outranks everything else: the agent stopped and is
+  // blocked on you, no matter what is still churning in the background.
+  if (session.lastTurnType === 'assistant'
+      && (session.lastTurnTools || []).some(t => BLOCKING_TOOLS.has(t))) {
+    return resting;
+  }
+
+  // Work is delegated and still in flight: a long job or a subagent fan-out.
+  // The session carries on by itself, so it outranks thinking — it is neither
+  // composing a reply nor blocked on you.
+  if (isLive && liveInfo.busy) return 'running';
+
+  if (!session.lastTurnType) return resting;
+
+  const ct = session.lastTurnContentTypes || [];
+  const turnFinished = session.lastTurnType === 'assistant'
+    && ct.includes('text')
+    && !ct.includes('tool_use');
+  if (turnFinished) return resting;
+
+  // Mid-turn: still working if the process is there, died mid-turn if not.
+  return isLive ? 'thinking' : 'idle';
 }
 
 // --- JSONL File Processing ---
@@ -282,6 +329,38 @@ const TERMINAL_MATCHERS = [
 const RAISABLE = new Set(['iTerm2', 'Terminal']);
 
 const LIVE_TTL_MS = 4000;
+// A shell this old is no longer an ordinary tool call — it is a real job.
+const BUSY_SHELL_MS = 30_000;
+const SUBAGENT_ACTIVE_MS = 60_000;
+const SCAN_FILE_BUDGET = 600;
+const SHELL_COMM_RE = /(^|\/)(zsh|bash|sh|fish)$/;
+
+// ps prints elapsed time as [[DD-]HH:]MM:SS
+function etimeSeconds(etime) {
+  const m = String(etime).match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+  if (!m) return 0;
+  return (+(m[1] || 0)) * 86400 + (+(m[2] || 0)) * 3600 + (+m[3]) * 60 + (+m[4]);
+}
+
+// Depth-first, short-circuits on the first fresh file and never walks forever.
+function hasRecentJsonl(root, withinMs) {
+  const cutoff = Date.now() - withinMs;
+  const stack = [root];
+  let budget = SCAN_FILE_BUDGET;
+  while (stack.length && budget > 0) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { continue; }
+    for (const ent of entries) {
+      if (budget-- <= 0) break;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) { stack.push(full); continue; }
+      if (!ent.name.endsWith('.jsonl')) continue;
+      try { if (fs.statSync(full).mtimeMs >= cutoff) return true; } catch (e) { /* raced */ }
+    }
+  }
+  return false;
+}
 let liveCache = { at: 0, byHash: new Map() };
 
 // Claude Code derives its project dir name by replacing every non-alphanumeric
@@ -308,16 +387,21 @@ function scanLiveClaudeProcs(force) {
   const byHash = new Map();
   if (process.platform !== 'win32') {
     try {
-      const psOut = execFileSync('ps', ['-axo', 'pid=,ppid=,tty=,comm='], {
+      // comm is used rather than args on purpose: command lines contain literal
+      // newlines, which breaks any line-based parse of ps output.
+      const psOut = execFileSync('ps', ['-axo', 'pid=,ppid=,tty=,etime=,comm='], {
         encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024,
       });
       const procs = new Map();
+      const childrenOf = new Map();
       const claudePids = [];
       for (const line of psOut.split('\n')) {
-        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/);
         if (!m) continue;
-        const proc = { pid: m[1], ppid: m[2], tty: m[3], comm: m[4].trim() };
+        const proc = { pid: m[1], ppid: m[2], tty: m[3], etime: m[4], comm: m[5].trim() };
         procs.set(proc.pid, proc);
+        if (!childrenOf.has(proc.ppid)) childrenOf.set(proc.ppid, []);
+        childrenOf.get(proc.ppid).push(proc);
         if (proc.comm === 'claude' || proc.comm.endsWith('/claude')) claudePids.push(proc.pid);
       }
 
@@ -340,9 +424,15 @@ function scanLiveClaudeProcs(force) {
           if (!proc || !cwd) continue;
           const tty = '/dev/' + proc.tty;
           if (!TTY_PATH_RE.test(tty)) continue; // no controlling tty (daemon/agent)
+          // A shell child of claude is a Bash tool call — foreground or
+          // backgrounded. One that has outlived BUSY_SHELL_MS is a real job.
+          // (MCP servers and hooks are node, so they never match.)
+          const busyShell = (childrenOf.get(pid) || []).some(
+            k => SHELL_COMM_RE.test(k.comm) && etimeSeconds(k.etime) * 1000 >= BUSY_SHELL_MS
+          );
           const hash = encodeProjectHash(cwd);
           if (!byHash.has(hash)) byHash.set(hash, []);
-          byHash.get(hash).push({ pid, tty, cwd, terminal: findTerminalApp(procs, pid) });
+          byHash.get(hash).push({ pid, tty, cwd, busyShell, terminal: findTerminalApp(procs, pid) });
         }
       }
     } catch (e) { /* ps unavailable */ }
@@ -370,7 +460,18 @@ function resolveLiveSessions(force) {
       .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0));
     procList.forEach((proc, i) => {
       const s = candidates[i];
-      if (s) live.set(s.sessionId, { tty: proc.tty, terminal: proc.terminal, pid: Number(proc.pid) });
+      if (!s) return;
+      // Subagents and workflow agents run in-process, so they spawn no shell —
+      // their JSONL traffic is the only sign they are alive.
+      const subagentDir = path.join(WATCH_DIR, s.projectHash, s.sessionId, 'subagents');
+      const busySubagents = hasRecentJsonl(subagentDir, SUBAGENT_ACTIVE_MS);
+      live.set(s.sessionId, {
+        tty: proc.tty,
+        terminal: proc.terminal,
+        pid: Number(proc.pid),
+        busy: proc.busyShell || busySubagents,
+        busyReason: proc.busyShell ? 'shell' : (busySubagents ? 'subagents' : null),
+      });
     });
   }
   return live;
@@ -485,10 +586,14 @@ app.post('/api/focus-session', express.json(), (req, res) => {
 });
 
 app.get('/api/sessions', (req, res) => {
+  // Liveness first: it decides both the status and the click behaviour.
+  const live = resolveLiveSessions(false);
+
   // Build list with derived status
   const all = [];
   for (const session of sessions.values()) {
-    const status = deriveStatus(session);
+    const info = live.get(session.sessionId);
+    const status = deriveStatus(session, info);
     // Convert subagents object to sorted array, only include active ones
     const subagentList = Object.values(session.subagents)
       .filter(s => s.status === 'thinking')
@@ -496,6 +601,12 @@ app.get('/api/sessions', (req, res) => {
     all.push({
       ...session,
       status,
+      live: !!info,
+      busy: info ? !!info.busy : false,
+      busyReason: info ? info.busyReason : null,
+      tty: info ? info.tty : null,
+      terminalApp: info ? info.terminal : null,
+      pid: info ? info.pid : null,
       costUSD: Math.round(session.costUSD * 10000) / 10000,
       subagents: subagentList,
     });
@@ -533,13 +644,6 @@ app.get('/api/sessions', (req, res) => {
     if (aToday !== bToday) return bToday - aToday; // active today first
     return (a.label || '').localeCompare(b.label || '');
   });
-  const live = resolveLiveSessions(false);
-  for (const s of result) {
-    const info = live.get(s.sessionId);
-    s.live = !!info;
-    if (info) { s.tty = info.tty; s.terminalApp = info.terminal; s.pid = info.pid; }
-  }
-
   res.json(result);
 });
 

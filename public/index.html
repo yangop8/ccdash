@@ -89,6 +89,7 @@
     }
     .card:hover { background: var(--bg-card-hover); }
     .card.status-thinking { border-left: 3px solid var(--green); }
+    .card.status-running  { border-left: 3px solid var(--blue); }
     .card.status-waiting  { border-left: 3px solid var(--yellow); }
     .card.status-error    { border-left: 3px solid var(--red); }
     .card.status-idle     { border-left: 3px solid #ff8800; opacity: 0.7; }
@@ -114,6 +115,7 @@
       flex-shrink: 0;
     }
     .status-dot.thinking { background: var(--green); animation: pulse 1.5s infinite; }
+    .status-dot.running  { background: var(--blue); animation: pulse 2.5s infinite; }
     .status-dot.waiting  { background: var(--yellow); animation: pulse 2s infinite; }
     .status-dot.error    { background: var(--red); }
     .status-dot.idle     { background: var(--grey); }
@@ -128,6 +130,7 @@
       font-weight: 500;
     }
     .card-status.thinking { color: var(--green); background: rgba(0,255,136,0.1); }
+    .card-status.running  { color: var(--blue); background: rgba(77,171,247,0.12); }
     .card-status.waiting  { color: var(--yellow); background: rgba(255,204,0,0.1); }
     .card-status.error    { color: var(--red); background: rgba(255,68,68,0.1); }
     .card-status.idle     { color: var(--grey); background: rgba(85,85,85,0.1); }
@@ -394,7 +397,12 @@
               : session.permissionMode === 'acceptEdits'
               ? e('span', { className: 'perm-badge accept-edits' }, 'AUTO-EDIT')
               : null,
-            e('span', { className: 'card-status ' + st }, st)
+            e('span', {
+              className: 'card-status ' + st,
+              title: st === 'running'
+                ? (session.busyReason === 'subagents' ? 'Subagents working' : 'Long-running job in a shell')
+                : ''
+            }, st)
           )
         ),
 
@@ -501,7 +509,7 @@
 
       const totalCost = sessions.reduce((s, x) => s + x.costUSD, 0);
       const totalOut = sessions.reduce((s, x) => s + x.tokensOut, 0);
-      const activeSessions = sessions.filter(s => s.status === 'thinking' || s.status === 'waiting').length;
+      const activeSessions = sessions.filter(s => s.status === 'thinking' || s.status === 'waiting' || s.status === 'running').length;
 
       return e('div', null,
         // Header
