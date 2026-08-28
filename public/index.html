@@ -132,6 +132,11 @@
     .card-status.thinking { color: var(--green); background: rgba(0,255,136,0.1); }
     .card-status.running  { color: var(--blue); background: rgba(77,171,247,0.12); }
     .card-status.waiting  { color: var(--yellow); background: rgba(255,204,0,0.1); }
+    /* Already looked at: still waiting, but no longer asking for attention. */
+    .card-status.waiting.seen { color: var(--text-dim); background: rgba(92,106,122,0.12); }
+    .card.status-waiting.seen { border-left-color: var(--text-dim); opacity: 0.6; }
+    .status-dot.waiting.seen { background: var(--text-dim); animation: none; }
+    .seen-tick { margin-right: 4px; opacity: 0.9; }
     .card-status.error    { color: var(--red); background: rgba(255,68,68,0.1); }
     .card-status.idle     { color: var(--grey); background: rgba(85,85,85,0.1); }
     .card-status.idle-stale { color: var(--border); background: rgba(30,42,58,0.3); }
@@ -357,7 +362,9 @@
       const st = session.status;
       const pct = contextPercent(session.lastTurnInputTotal || session.tokensIn);
 
-      return e('div', { className: 'card status-' + st },
+      const seen = session.seen && st === 'waiting';
+
+      return e('div', { className: 'card status-' + st + (seen ? ' seen' : '') },
         // Header
         e('div', { className: 'card-header' },
           e('div', null,
@@ -385,7 +392,7 @@
                 ? 'Jump to terminal — ' + (session.terminalApp || '?') + ' ' + (session.tty || '')
                 : (session.cwd ? 'Open folder — ' + session.cwd : '')
             },
-              e('span', { className: 'status-dot ' + st }),
+              e('span', { className: 'status-dot ' + st + (seen ? ' seen' : '') }),
               session.label || session.sessionId.substring(0, 8),
               session.live ? e('span', { className: 'live-badge' }, 'LIVE') : null
             ),
@@ -398,11 +405,13 @@
               ? e('span', { className: 'perm-badge accept-edits' }, 'AUTO-EDIT')
               : null,
             e('span', {
-              className: 'card-status ' + st,
-              title: st === 'running'
+              className: 'card-status ' + st + (seen ? ' seen' : ''),
+              title: seen
+                ? 'Already opened — clears when this session moves, or after 2h'
+                : st === 'running'
                 ? (session.busyReason === 'subagents' ? 'Subagents working' : 'Long-running job in a shell')
                 : ''
-            }, st)
+            }, seen ? [e('span', { key: 't', className: 'seen-tick' }, '✓'), st] : st)
           )
         ),
 

@@ -539,6 +539,36 @@ function openFolder(folder) {
   return true;
 }
 
+// --- Acknowledged ("seen") Sessions ---
+// Jumping to a session that is waiting counts as reading it. The mark holds
+// only while nothing has moved: the moment a new conversation event lands the
+// human clearly engaged, so it is spent. Two hours is the backstop for the
+// "not today" case, where the window is left open and untouched.
+//
+// Deliberately in memory: the mark is worth less than its own TTL, so
+// persisting it across a watcher restart would buy nothing.
+const SEEN_TTL_MS = 2 * 60 * 60 * 1000;
+const seenSessions = new Map(); // sessionId -> { at, turnAt }
+
+function markSeen(sessionId) {
+  const session = sessions.get(sessionId);
+  seenSessions.set(sessionId, {
+    at: Date.now(),
+    turnAt: session ? session.lastTurnAt : null,
+  });
+}
+
+function isSeen(session) {
+  const ack = seenSessions.get(session.sessionId);
+  if (!ack) return false;
+  const moved = ack.turnAt !== session.lastTurnAt;
+  if (moved || Date.now() - ack.at >= SEEN_TTL_MS) {
+    seenSessions.delete(session.sessionId);
+    return false;
+  }
+  return true;
+}
+
 // --- Express Server ---
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -581,6 +611,7 @@ app.post('/api/focus-session', express.json(), (req, res) => {
 
   raiseTerminal(info.terminal, info.tty, (err) => {
     if (err) return fallback(err.message === 'tty-not-found' ? 'tty-not-found' : 'applescript-failed');
+    markSeen(sessionId);
     res.json({ ok: true, action: 'raised', terminal: info.terminal, tty: info.tty });
   });
 });
@@ -602,6 +633,7 @@ app.get('/api/sessions', (req, res) => {
       ...session,
       status,
       live: !!info,
+      seen: isSeen(session),
       busy: info ? !!info.busy : false,
       busyReason: info ? info.busyReason : null,
       tty: info ? info.tty : null,
