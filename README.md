@@ -23,6 +23,8 @@ waiting for you since lunch.
   (iTerm2 and Terminal), or opens its folder when it is no longer running
 - **Read marks** — a session you have already opened stops competing for attention until
   it actually moves
+- **Resume a dead session in one click** — opens a new terminal in its working
+  directory and picks the conversation up where it stopped
 - **Token and cost tracking** — per-session and combined, with per-model pricing and
   correct cache accounting
 - **Context window usage** — per-model, so the bar means something

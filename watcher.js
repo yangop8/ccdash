@@ -517,6 +517,30 @@ function resolveLiveSessions(force) {
 
 // Window indices shift as soon as a window is activated, so read every property
 // before selecting anything.
+// Opens a new window and types one command into it. The command is passed as
+// argv and never interpolated into the script source.
+const LAUNCH_SCRIPTS = {
+  iTerm2: `on run argv
+  set theCommand to item 1 of argv
+  tell application "iTerm2"
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+      write text theCommand
+    end tell
+    activate
+  end tell
+  return "LAUNCHED"
+end run`,
+  Terminal: `on run argv
+  set theCommand to item 1 of argv
+  tell application "Terminal"
+    do script theCommand
+    activate
+  end tell
+  return "LAUNCHED"
+end run`,
+};
+
 const RAISE_SCRIPTS = {
   iTerm2: `on run argv
   set targetTty to item 1 of argv
@@ -562,6 +586,41 @@ function raiseTerminal(terminal, tty, cb) {
   const child = execFileAsync('osascript', ['-', tty], { timeout: 8000 }, (err, stdout) => {
     if (err) return cb(err);
     if (!String(stdout).includes('RAISED')) return cb(new Error('tty-not-found'));
+    cb(null);
+  });
+  child.stdin.on('error', () => {});
+  child.stdin.end(script);
+}
+
+// A dead session has no process to walk up from, so the terminal is chosen
+// from whatever is currently running, preferring iTerm2.
+function detectTerminalApp() {
+  const byPreference = ['iTerm2', 'Terminal'];
+  try {
+    const out = execFileSync('ps', ['-axo', 'comm='], {
+      encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024,
+    });
+    const running = out.split('\n').map(s => s.trim());
+    for (const app of byPreference) {
+      const matcher = TERMINAL_MATCHERS.find(m => m.app === app);
+      if (running.some(c => c && matcher && matcher.re.test(c))) return app;
+    }
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+// Single-quote for the shell; the only character that matters inside single
+// quotes is the single quote itself.
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+function launchInTerminal(terminal, command, cb) {
+  const script = LAUNCH_SCRIPTS[terminal];
+  if (!script) return cb(new Error('terminal-unsupported'));
+  const child = execFileAsync('osascript', ['-', command], { timeout: 15000 }, (err, stdout) => {
+    if (err) return cb(err);
+    if (!String(stdout).includes('LAUNCHED')) return cb(new Error('launch-failed'));
     cb(null);
   });
   child.stdin.on('error', () => {});
@@ -651,6 +710,38 @@ app.post('/api/focus-session', express.json(), (req, res) => {
     if (err) return fallback(err.message === 'tty-not-found' ? 'tty-not-found' : 'applescript-failed');
     markSeen(sessionId);
     res.json({ ok: true, action: 'raised', terminal: info.terminal, tty: info.tty });
+  });
+});
+
+// Bring a session that is no longer running back up, in a new terminal
+// window, resuming the same conversation rather than starting a blank one.
+app.post('/api/resume-session', express.json(), (req, res) => {
+  const sessionId = req.body && req.body.sessionId;
+  if (!sessionId || typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+    return res.status(400).json({ error: 'Bad sessionId' });
+  }
+  const known = sessions.get(sessionId);
+  if (!known) return res.status(404).json({ error: 'Unknown session' });
+
+  // Refuse rather than start a second copy alongside a live one.
+  if (resolveLiveSessions(true).has(sessionId)) {
+    return res.status(409).json({ error: 'Session is already running' });
+  }
+
+  const cwd = known.cwd;
+  let stat;
+  try { stat = fs.statSync(cwd); } catch (e) { stat = null; }
+  if (!stat || !stat.isDirectory()) {
+    return res.status(404).json({ error: 'Working directory is gone: ' + cwd });
+  }
+
+  const terminal = detectTerminalApp();
+  if (!terminal) return res.status(501).json({ error: 'No supported terminal is running' });
+
+  const command = 'cd ' + shellQuote(cwd) + ' && claude --resume ' + shellQuote(sessionId);
+  launchInTerminal(terminal, command, (err) => {
+    if (err) return res.status(500).json({ error: 'Launch failed: ' + err.message });
+    res.json({ ok: true, terminal, cwd });
   });
 });
 

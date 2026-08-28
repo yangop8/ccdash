@@ -194,6 +194,24 @@
     .card.status-waiting.seen { border-left-color: var(--text-dim); opacity: 0.6; }
     .status-dot.waiting.seen { background: var(--text-dim); animation: none; }
     .seen-tick { margin-right: 4px; opacity: 0.9; }
+
+    /* Only on sessions whose process is gone: brings the conversation back. */
+    .resume-btn {
+      font-family: inherit;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      padding: 2px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      color: var(--blue);
+      background: var(--tint-blue);
+      border: 1px solid var(--tint-blue);
+      transition: border-color 0.15s, opacity 0.15s;
+    }
+    .resume-btn:hover { border-color: var(--blue); }
+    .resume-btn:disabled { cursor: default; opacity: 0.55; }
+    .resume-btn.failed { color: var(--red); background: var(--tint-red); border-color: var(--tint-red); }
     .card-status.error    { color: var(--red); background: var(--tint-red); }
     .card-status.idle     { color: var(--grey); background: var(--tint-grey); }
     .card-status.idle-stale { color: var(--stale-chip-fg); background: var(--tint-stale); }
@@ -419,6 +437,44 @@
       return 'var(--blue)';
     }
 
+    function ResumeButton({ session }) {
+      // idle -> launching -> done (the card flips to live on the next poll)
+      const [state, setState] = useState('idle');
+      const [err, setErr] = useState('');
+
+      const label = state === 'launching' ? 'STARTING…'
+        : state === 'failed' ? 'FAILED'
+        : state === 'done' ? 'STARTED'
+        : '▶ RESUME';
+
+      return e('button', {
+        className: 'resume-btn' + (state === 'failed' ? ' failed' : ''),
+        disabled: state !== 'idle' && state !== 'failed',
+        title: err || ('Open a new terminal in ' + session.cwd + ' and resume this conversation'),
+        onClick: (ev) => {
+          ev.stopPropagation();
+          setState('launching');
+          setErr('');
+          fetch('/api/resume-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: session.sessionId })
+          }).then(r => r.json().then(d => ({ ok: r.ok, d })))
+            .then(({ ok, d }) => {
+              if (ok && d.ok) { setState('done'); return; }
+              setState('failed');
+              setErr((d && d.error) || 'Launch failed');
+              setTimeout(() => setState('idle'), 4000);
+            })
+            .catch(() => {
+              setState('failed');
+              setErr('Could not reach the dashboard');
+              setTimeout(() => setState('idle'), 4000);
+            });
+        }
+      }, label);
+    }
+
     function SessionCard({ session }) {
       const [expanded, setExpanded] = useState(false);
       const st = session.status;
@@ -462,6 +518,9 @@
             session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null
           ),
           e('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
+            !session.live && session.cwd
+              ? e(ResumeButton, { session })
+              : null,
             session.permissionMode === 'bypassPermissions'
               ? e('span', { className: 'perm-badge bypass' }, 'YOLO')
               : session.permissionMode === 'acceptEdits'
