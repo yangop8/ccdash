@@ -143,6 +143,21 @@
     .perm-badge.bypass { color: var(--red); background: rgba(255,68,68,0.15); }
     .perm-badge.accept-edits { color: var(--yellow); background: rgba(255,204,0,0.12); }
 
+    .live-badge {
+      font-size: 9px;
+      padding: 0 5px;
+      border-radius: 3px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      color: var(--green);
+      background: rgba(0,255,136,0.10);
+      border: 1px solid rgba(0,255,136,0.25);
+    }
+    .card-label { transition: color 0.15s; }
+    .card-label.is-live:hover { color: var(--green); }
+    .card-label.flash-raised { color: var(--green); }
+    .card-label.flash-folder { color: var(--blue); }
+
     /* Subagents */
     .subagents {
       margin-bottom: 10px;
@@ -343,25 +358,33 @@
         // Header
         e('div', { className: 'card-header' },
           e('div', null,
-            e('div', { className: 'card-label',
+            e('div', { className: 'card-label' + (session.live ? ' is-live' : ''),
               style: session.cwd ? { cursor: 'pointer' } : {},
               onClick: session.cwd ? (ev) => {
-                fetch('/api/open-folder', {
+                const el = ev.currentTarget;
+                fetch('/api/focus-session', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ path: session.cwd })
-                }).then(r => {
-                  if (!r.ok) {
-                    const el = ev.currentTarget;
-                    el.style.textDecoration = 'line-through';
-                    el.title = 'Folder not found: ' + session.cwd;
-                  }
-                });
+                  body: JSON.stringify({ sessionId: session.sessionId, path: session.cwd })
+                }).then(r => r.json().then(d => ({ ok: r.ok, d })))
+                  .then(({ ok, d }) => {
+                    if (!ok || !d.ok) {
+                      el.style.textDecoration = 'line-through';
+                      el.title = d.error || ('Not found: ' + session.cwd);
+                      return;
+                    }
+                    const cls = d.action === 'raised' ? 'flash-raised' : 'flash-folder';
+                    el.classList.add(cls);
+                    setTimeout(() => el.classList.remove(cls), 600);
+                  });
               } : undefined,
-              title: session.cwd || ''
+              title: session.live
+                ? 'Jump to terminal — ' + (session.terminalApp || '?') + ' ' + (session.tty || '')
+                : (session.cwd ? 'Open folder — ' + session.cwd : '')
             },
               e('span', { className: 'status-dot ' + st }),
-              session.label || session.sessionId.substring(0, 8)
+              session.label || session.sessionId.substring(0, 8),
+              session.live ? e('span', { className: 'live-badge' }, 'LIVE') : null
             ),
             session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null
           ),

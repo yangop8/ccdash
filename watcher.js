@@ -49,6 +49,7 @@ function getOrCreateSession(sessionId) {
       lastTurnInputTotal: 0, // input + cache for context window estimate
       permissionMode: '',
       version: '',
+      aiTitle: '',
       subagents: {}, // agentId -> { task, status, tokensOut, lastEventAt }
     });
     seenMessageIds.set(sessionId, new Map()); // messageId -> {in, out, cacheCreate, cacheRead}
@@ -99,6 +100,7 @@ function processEvent(event, projectHash) {
     session.gitBranch = event.gitBranch;
   }
   if (event.version) session.version = event.version;
+  if (event.aiTitle) session.aiTitle = event.aiTitle;
   if (event.permissionMode) session.permissionMode = event.permissionMode;
 
   const msg = event.message || {};
@@ -256,6 +258,186 @@ function processFile(filePath) {
   });
 }
 
+// --- Live Session -> Terminal Resolution ---
+// A dashboard session maps to a real terminal window through this chain:
+//   session.projectHash  <=  encoded cwd of a running `claude` process
+//   that process's tty   =>  the terminal emulator window holding that tty
+// Claude Code does not keep the JSONL open, so the process table is the only
+// reliable liveness signal (the /tmp session dirs persist long after exit).
+const { execFileSync, execFile: execFileAsync } = require('child_process');
+
+const TTY_PATH_RE = /^\/dev\/ttys[0-9]+$/;
+const SESSION_ID_RE = /^[0-9a-fA-F][0-9a-fA-F-]{7,63}$/;
+
+const TERMINAL_MATCHERS = [
+  { re: /(^|\/)iTerm2?$/i, app: 'iTerm2' },
+  { re: /(^|\/)iTermServer/i, app: 'iTerm2' },
+  { re: /(^|\/)Terminal$/, app: 'Terminal' },
+  { re: /(^|\/)ghostty$/i, app: 'Ghostty' },
+  { re: /(^|\/)wezterm/i, app: 'WezTerm' },
+  { re: /(^|\/)kitty$/i, app: 'kitty' },
+  { re: /(^|\/)alacritty$/i, app: 'Alacritty' },
+];
+// Only these can be driven by AppleScript today; others fall back to the folder.
+const RAISABLE = new Set(['iTerm2', 'Terminal']);
+
+const LIVE_TTL_MS = 4000;
+let liveCache = { at: 0, byHash: new Map() };
+
+// Claude Code derives its project dir name by replacing every non-alphanumeric
+// character of the launch cwd with '-'. Verified against live sessions.
+function encodeProjectHash(cwd) {
+  return String(cwd || '').replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+function findTerminalApp(procs, pid) {
+  let cur = procs.get(pid);
+  for (let i = 0; i < 8 && cur; i++) {
+    cur = procs.get(cur.ppid);
+    if (!cur) break;
+    for (const m of TERMINAL_MATCHERS) if (m.re.test(cur.comm)) return m.app;
+  }
+  return null;
+}
+
+// projectHash -> [{ pid, tty, cwd, terminal }]
+function scanLiveClaudeProcs(force) {
+  const now = Date.now();
+  if (!force && now - liveCache.at < LIVE_TTL_MS) return liveCache.byHash;
+
+  const byHash = new Map();
+  if (process.platform !== 'win32') {
+    try {
+      const psOut = execFileSync('ps', ['-axo', 'pid=,ppid=,tty=,comm='], {
+        encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024,
+      });
+      const procs = new Map();
+      const claudePids = [];
+      for (const line of psOut.split('\n')) {
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+        if (!m) continue;
+        const proc = { pid: m[1], ppid: m[2], tty: m[3], comm: m[4].trim() };
+        procs.set(proc.pid, proc);
+        if (proc.comm === 'claude' || proc.comm.endsWith('/claude')) claudePids.push(proc.pid);
+      }
+
+      if (claudePids.length) {
+        const cwds = new Map();
+        try {
+          const lsofOut = execFileSync('lsof', ['-a', '-p', claudePids.join(','), '-d', 'cwd', '-Fpn'], {
+            encoding: 'utf8', timeout: 5000, maxBuffer: 4 * 1024 * 1024,
+          });
+          let cur = null;
+          for (const line of lsofOut.split('\n')) {
+            if (line.startsWith('p')) cur = line.slice(1);
+            else if (line.startsWith('n') && cur) { cwds.set(cur, line.slice(1)); cur = null; }
+          }
+        } catch (e) { /* no lsof -> no live detection, fall back to folder */ }
+
+        for (const pid of claudePids) {
+          const proc = procs.get(pid);
+          const cwd = cwds.get(pid);
+          if (!proc || !cwd) continue;
+          const tty = '/dev/' + proc.tty;
+          if (!TTY_PATH_RE.test(tty)) continue; // no controlling tty (daemon/agent)
+          const hash = encodeProjectHash(cwd);
+          if (!byHash.has(hash)) byHash.set(hash, []);
+          byHash.get(hash).push({ pid, tty, cwd, terminal: findTerminalApp(procs, pid) });
+        }
+      }
+    } catch (e) { /* ps unavailable */ }
+  }
+  liveCache = { at: now, byHash };
+  return byHash;
+}
+
+// sessionId -> { tty, terminal, pid }
+// When a project has several running processes, the most recently active
+// sessions take them in order — one process per session.
+function resolveLiveSessions(force) {
+  const byHash = scanLiveClaudeProcs(force);
+  const live = new Map();
+  if (!byHash.size) return live;
+
+  const grouped = new Map();
+  for (const s of sessions.values()) {
+    if (!byHash.has(s.projectHash)) continue;
+    if (!grouped.has(s.projectHash)) grouped.set(s.projectHash, []);
+    grouped.get(s.projectHash).push(s);
+  }
+  for (const [hash, procList] of byHash) {
+    const candidates = (grouped.get(hash) || [])
+      .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0));
+    procList.forEach((proc, i) => {
+      const s = candidates[i];
+      if (s) live.set(s.sessionId, { tty: proc.tty, terminal: proc.terminal, pid: Number(proc.pid) });
+    });
+  }
+  return live;
+}
+
+// Window indices shift as soon as a window is activated, so read every property
+// before selecting anything.
+const RAISE_SCRIPTS = {
+  iTerm2: `on run argv
+  set targetTty to item 1 of argv
+  tell application "iTerm2"
+    repeat with w in windows
+      repeat with t in tabs of w
+        repeat with s in sessions of t
+          if (tty of s) is targetTty then
+            select s
+            select t
+            select w
+            activate
+            return "RAISED"
+          end if
+        end repeat
+      end repeat
+    end repeat
+  end tell
+  return "NOT_FOUND"
+end run`,
+  Terminal: `on run argv
+  set targetTty to item 1 of argv
+  tell application "Terminal"
+    repeat with w in windows
+      repeat with t in tabs of w
+        if (tty of t) is targetTty then
+          set selected of t to true
+          set frontmost of w to true
+          activate
+          return "RAISED"
+        end if
+      end repeat
+    end repeat
+  end tell
+  return "NOT_FOUND"
+end run`,
+};
+
+function raiseTerminal(terminal, tty, cb) {
+  const script = RAISE_SCRIPTS[terminal];
+  if (!script || !TTY_PATH_RE.test(tty)) return cb(new Error('unsupported'));
+  // tty goes in as argv, never interpolated into the script source
+  const child = execFileAsync('osascript', ['-', tty], { timeout: 8000 }, (err, stdout) => {
+    if (err) return cb(err);
+    if (!String(stdout).includes('RAISED')) return cb(new Error('tty-not-found'));
+    cb(null);
+  });
+  child.stdin.on('error', () => {});
+  child.stdin.end(script);
+}
+
+function openFolder(folder) {
+  if (!folder || typeof folder !== 'string' || !fs.existsSync(folder)) return false;
+  const plat = process.platform;
+  if (plat === 'win32') execFileAsync('explorer', [folder.replace(/\//g, '\\')], () => {});
+  else if (plat === 'darwin') execFileAsync('open', [folder], () => {});
+  else execFileAsync('xdg-open', [folder], () => {});
+  return true;
+}
+
 // --- Express Server ---
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -274,6 +456,32 @@ app.post('/api/open-folder', express.json(), (req, res) => {
     execFile('xdg-open', [folder], () => {});
   }
   res.json({ ok: true });
+});
+
+// Click a session: jump to its terminal window if it is running, otherwise
+// fall back to revealing its folder.
+app.post('/api/focus-session', express.json(), (req, res) => {
+  const sessionId = req.body && req.body.sessionId;
+  if (!sessionId || typeof sessionId !== 'string' || !SESSION_ID_RE.test(sessionId)) {
+    return res.status(400).json({ error: 'Bad sessionId' });
+  }
+  const known = sessions.get(sessionId);
+  const folder = (known && known.cwd) ||
+    (typeof (req.body && req.body.path) === 'string' ? req.body.path : '');
+
+  const info = resolveLiveSessions(true).get(sessionId);
+  const fallback = (reason) => {
+    if (openFolder(folder)) return res.json({ ok: true, action: 'folder', reason });
+    return res.status(404).json({ error: 'Folder not found: ' + folder, reason });
+  };
+
+  if (!info) return fallback('not-running');
+  if (!RAISABLE.has(info.terminal)) return fallback('terminal-unsupported:' + (info.terminal || 'unknown'));
+
+  raiseTerminal(info.terminal, info.tty, (err) => {
+    if (err) return fallback(err.message === 'tty-not-found' ? 'tty-not-found' : 'applescript-failed');
+    res.json({ ok: true, action: 'raised', terminal: info.terminal, tty: info.tty });
+  });
 });
 
 app.get('/api/sessions', (req, res) => {
@@ -325,6 +533,13 @@ app.get('/api/sessions', (req, res) => {
     if (aToday !== bToday) return bToday - aToday; // active today first
     return (a.label || '').localeCompare(b.label || '');
   });
+  const live = resolveLiveSessions(false);
+  for (const s of result) {
+    const info = live.get(s.sessionId);
+    s.live = !!info;
+    if (info) { s.tty = info.tty; s.terminalApp = info.terminal; s.pid = info.pid; }
+  }
+
   res.json(result);
 });
 
