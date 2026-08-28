@@ -87,6 +87,7 @@ function getOrCreateSession(sessionId) {
       lastTurnType: '',        // 'user' | 'assistant' — main conversation only
       lastTurnContentTypes: [],
       lastTurnTools: [],
+      lastTurnHandback: false, // true once control is back with the human
       lastTurnAt: null,
       lastTurnInputTotal: 0, // input + cache for context window estimate
       permissionMode: '',
@@ -97,6 +98,38 @@ function getOrCreateSession(sessionId) {
     seenMessageIds.set(sessionId, new Map()); // messageId -> {in, out, cacheCreate, cacheRead}
   }
   return sessions.get(sessionId);
+}
+
+// A slash command leaves several user events behind: the typed line, a caveat
+// block, an echo of the command, and its stdout. Only the last of those means
+// anything for status — the command ran, and control is back with the human.
+// Without this a finished /compact or /login reads as a prompt still awaiting
+// an answer, because the raw event type is just 'user'.
+const COMMAND_OUTPUT_RE = /^\s*<local-command-(stdout|stderr)>/;
+const COMMAND_ECHO_RE = /^\s*<command-(name|message|args|contents)>/;
+
+function firstText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  const block = content.find(c => c && c.type === 'text');
+  return (block && typeof block.text === 'string') ? block.text : '';
+}
+
+// 'handback' — control is with the human; 'pending' — the agent owes a reply;
+// null — carries no turn meaning and must not overwrite the previous state.
+function classifyTurn(event, contentTypes, content) {
+  if (event.isMeta) return null;             // caveat and other injected blocks
+  if (event.isCompactSummary) return null;   // the seed written when compacting
+
+  if (event.type === 'assistant') {
+    if (contentTypes.includes('tool_use')) return 'pending';
+    return contentTypes.includes('text') ? 'handback' : 'pending';
+  }
+
+  const text = firstText(content);
+  if (COMMAND_OUTPUT_RE.test(text)) return 'handback';
+  if (COMMAND_ECHO_RE.test(text)) return null;
+  return 'pending';                          // a real prompt, or a tool_result
 }
 
 function addToRecentLog(session, entry) {
@@ -156,12 +189,16 @@ function processEvent(event, projectHash) {
   // constantly (thousands per session) and would otherwise overwrite the last
   // real exchange, and sidechain events belong to subagents, not this turn.
   if (!event.isSidechain && (event.type === 'user' || event.type === 'assistant')) {
-    session.lastTurnType = event.type;
-    session.lastTurnContentTypes = contentTypes;
-    session.lastTurnTools = Array.isArray(content)
-      ? content.filter(c => c.type === 'tool_use').map(c => c.name).filter(Boolean)
-      : [];
-    session.lastTurnAt = ts;
+    const kind = classifyTurn(event, contentTypes, content);
+    if (kind !== null) {
+      session.lastTurnType = event.type;
+      session.lastTurnContentTypes = contentTypes;
+      session.lastTurnTools = Array.isArray(content)
+        ? content.filter(c => c.type === 'tool_use').map(c => c.name).filter(Boolean)
+        : [];
+      session.lastTurnHandback = kind === 'handback';
+      session.lastTurnAt = ts;
+    }
   }
 
   if (event.type === 'assistant' && msg.usage) {
@@ -304,13 +341,18 @@ function deriveStatus(session, liveInfo) {
   // composing a reply nor blocked on you.
   if (isLive && liveInfo.busy) return 'running';
 
-  if (!session.lastTurnType) return resting;
+  // `claude --resume` writes nothing until you type, so a session restored
+  // from a transcript that ended mid-turn would otherwise look like it is
+  // still working on a prompt from days ago. A process younger than the last
+  // exchange cannot be the one that was handling it — it just loaded the file
+  // and is sitting at the prompt.
+  if (isLive && session.lastTurnAt
+      && liveInfo.startedMs > new Date(session.lastTurnAt).getTime() + RESUME_SKEW_MS) {
+    return resting;
+  }
 
-  const ct = session.lastTurnContentTypes || [];
-  const turnFinished = session.lastTurnType === 'assistant'
-    && ct.includes('text')
-    && !ct.includes('tool_use');
-  if (turnFinished) return resting;
+  if (!session.lastTurnType) return resting;
+  if (session.lastTurnHandback) return resting;
 
   // Mid-turn: still working if the process is there, died mid-turn if not.
   return isLive ? 'thinking' : 'idle';
@@ -371,6 +413,9 @@ const LIVE_TTL_MS = 4000;
 const BUSY_SHELL_MS = 30_000;
 const SUBAGENT_ACTIVE_MS = 60_000;
 const SCAN_FILE_BUDGET = 600;
+// ps reports elapsed time to the second and the scan is cached, so only treat
+// a process as newer than the transcript when it is clearly newer.
+const RESUME_SKEW_MS = 5000;
 const SHELL_COMM_RE = /(^|\/)(zsh|bash|sh|fish)$/;
 
 // ps prints elapsed time as [[DD-]HH:]MM:SS
@@ -470,7 +515,11 @@ function scanLiveClaudeProcs(force) {
           );
           const hash = encodeProjectHash(cwd);
           if (!byHash.has(hash)) byHash.set(hash, []);
-          byHash.get(hash).push({ pid, tty, cwd, busyShell, terminal: findTerminalApp(procs, pid) });
+          byHash.get(hash).push({
+            pid, tty, cwd, busyShell,
+            startedMs: now - etimeSeconds(proc.etime) * 1000,
+            terminal: findTerminalApp(procs, pid),
+          });
         }
       }
     } catch (e) { /* ps unavailable */ }
@@ -507,6 +556,7 @@ function resolveLiveSessions(force) {
         tty: proc.tty,
         terminal: proc.terminal,
         pid: Number(proc.pid),
+        startedMs: proc.startedMs,
         busy: proc.busyShell || busySubagents,
         busyReason: proc.busyShell ? 'shell' : (busySubagents ? 'subagents' : null),
       });

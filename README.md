@@ -77,6 +77,11 @@ enough to be useful mislabels a working agent as done.
 indistinguishable from a running tool and reads as `thinking`. Tools that block on a human
 by name — `AskUserQuestion`, `ExitPlanMode` — are detected and read as `waiting`.
 
+A slash command leaves four user events behind — the typed line, a caveat, an echo, and
+its stdout. Only the stdout carries meaning for status: the command ran and control is
+back with you. Without that distinction a finished `/compact` reads as a prompt still
+awaiting an answer.
+
 ## Requirements
 
 - **Node.js** v18+
