@@ -524,6 +524,9 @@ const LAUNCH_SCRIPTS = {
   set theCommand to item 1 of argv
   tell application "iTerm2"
     set newWindow to (create window with default profile)
+    try
+      set zoomed of newWindow to true
+    end try
     tell current session of newWindow
       write text theCommand
     end tell
@@ -535,6 +538,9 @@ end run`,
   set theCommand to item 1 of argv
   tell application "Terminal"
     do script theCommand
+    try
+      set zoomed of front window to true
+    end try
     activate
   end tell
   return "LAUNCHED"
