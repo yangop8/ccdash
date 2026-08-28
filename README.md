@@ -6,7 +6,7 @@ click.
 
 ![ccdash screenshot](Screenshot.png)
 
-> The screenshot predates the status and jump work below; it shows the original layout.
+> Project names, filenames and dollar amounts are pixelated; everything else is a live capture.
 
 ## Why
 
