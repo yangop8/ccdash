@@ -5,18 +5,56 @@ const express = require('express');
 const chokidar = require('chokidar');
 
 // --- Pricing ---
+// USD per 1M tokens. Verified against Anthropic's published rates 2026-08-27.
 const PRICING = {
-  'claude-opus-4-6':   { input: 15.00, output: 75.00 },
+  'claude-fable-5':    { input: 10.00, output: 50.00 },
+  'claude-mythos-5':   { input: 10.00, output: 50.00 },
+  'claude-opus-5':     { input: 5.00,  output: 25.00 },
+  'claude-opus-4-8':   { input: 5.00,  output: 25.00 },
+  'claude-opus-4-7':   { input: 5.00,  output: 25.00 },
+  'claude-opus-4-6':   { input: 5.00,  output: 25.00 },
+  'claude-sonnet-5':   { input: 2.00,  output: 10.00 },
   'claude-sonnet-4-6': { input: 3.00,  output: 15.00 },
-  'claude-haiku-4-5':  { input: 0.80,  output: 4.00 },
+  'claude-haiku-4-5':  { input: 1.00,  output: 5.00 },
 };
 
-function getPricing(model) {
-  if (!model) return PRICING['claude-sonnet-4-6'];
-  for (const [key, val] of Object.entries(PRICING)) {
+// Cache writes cost 1.25x the base input rate, cache reads 0.1x.
+const CACHE_WRITE_MULTIPLIER = 1.25;
+const CACHE_READ_MULTIPLIER = 0.10;
+
+// Context window per model. Every current model is 1M; only Haiku 4.5 is 200K.
+const CONTEXT_WINDOW = {
+  'claude-fable-5':    1_000_000,
+  'claude-mythos-5':   1_000_000,
+  'claude-opus-5':     1_000_000,
+  'claude-opus-4-8':   1_000_000,
+  'claude-opus-4-7':   1_000_000,
+  'claude-opus-4-6':   1_000_000,
+  'claude-sonnet-5':   1_000_000,
+  'claude-sonnet-4-6': 1_000_000,
+  'claude-haiku-4-5':  200_000,
+};
+const LEGACY_CONTEXT_WINDOW = 200_000;
+
+// An unlisted model is assumed legacy-sized until its own traffic proves
+// otherwise — better than reporting a permanent 100%.
+function getContextWindow(model, observedInput) {
+  const known = model && (CONTEXT_WINDOW[model] || lookupByPrefix(CONTEXT_WINDOW, model));
+  if (known) return known;
+  return (observedInput || 0) > LEGACY_CONTEXT_WINDOW ? 1_000_000 : LEGACY_CONTEXT_WINDOW;
+}
+
+function lookupByPrefix(table, model) {
+  for (const [key, val] of Object.entries(table)) {
     if (model.includes(key)) return val;
   }
-  return PRICING['claude-sonnet-4-6']; // fallback
+  return null;
+}
+
+function getPricing(model) {
+  if (!model) return PRICING['claude-opus-5'];
+  if (PRICING[model]) return PRICING[model];
+  return lookupByPrefix(PRICING, model) || PRICING['claude-opus-5'];
 }
 
 // --- Session State ---
@@ -158,8 +196,8 @@ function processEvent(event, projectHash) {
     session.costUSD =
       (session.tokensIn * pricing.input / 1_000_000) +
       (session.tokensOut * pricing.output / 1_000_000) +
-      (session.cacheCreationIn * pricing.input * 0.25 / 1_000_000) +
-      (session.cacheReadIn * pricing.input * 0.10 / 1_000_000);
+      (session.cacheCreationIn * pricing.input * CACHE_WRITE_MULTIPLIER / 1_000_000) +
+      (session.cacheReadIn * pricing.input * CACHE_READ_MULTIPLIER / 1_000_000);
 
     // Log tool use
     if (Array.isArray(content)) {
@@ -633,6 +671,7 @@ app.get('/api/sessions', (req, res) => {
       ...session,
       status,
       live: !!info,
+      contextWindow: getContextWindow(session.model, session.lastTurnInputTotal),
       seen: isSeen(session),
       busy: info ? !!info.busy : false,
       busyReason: info ? info.busyReason : null,

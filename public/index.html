@@ -346,9 +346,14 @@
       return new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
     }
 
-    function contextPercent(lastTurnInputTotal) {
-      // 200K context window
-      return Math.min(100, (lastTurnInputTotal / 200_000) * 100);
+    // The window is per-model and comes from the server; never assume it here.
+    function contextPercent(lastTurnInputTotal, windowSize) {
+      if (!windowSize) return 0;
+      return Math.min(100, (lastTurnInputTotal / windowSize) * 100);
+    }
+
+    function formatWindow(n) {
+      return n >= 1_000_000 ? (n / 1_000_000) + 'M' : Math.round(n / 1000) + 'K';
     }
 
     function contextBarColor(pct) {
@@ -360,7 +365,8 @@
     function SessionCard({ session }) {
       const [expanded, setExpanded] = useState(false);
       const st = session.status;
-      const pct = contextPercent(session.lastTurnInputTotal || session.tokensIn);
+      const ctxWindow = session.contextWindow || 200_000;
+      const pct = contextPercent(session.lastTurnInputTotal || session.tokensIn, ctxWindow);
 
       const seen = session.seen && st === 'waiting';
 
@@ -447,7 +453,8 @@
         e('div', { className: 'context-bar-container' },
           e('div', { className: 'context-bar-label' },
             e('span', null, 'Context Window'),
-            e('span', null, pct.toFixed(0) + '%')
+            e('span', { title: Math.round((session.lastTurnInputTotal || 0) / 1000) + 'K of ' + formatWindow(ctxWindow) },
+              pct.toFixed(0) + '% of ' + formatWindow(ctxWindow))
           ),
           e('div', { className: 'context-bar' },
             e('div', { className: 'context-bar-fill', style: {
