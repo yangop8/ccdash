@@ -420,6 +420,11 @@ const LIVE_TTL_MS = 4000;
 // A shell this old is no longer an ordinary tool call — it is a real job.
 const BUSY_SHELL_MS = 30_000;
 const SUBAGENT_ACTIVE_MS = 60_000;
+// A workflow agent can think for minutes without writing, so its log needs a
+// far more forgiving window than a plain subagent's. The journal is what keeps
+// that from pinning a finished workflow at 'running'.
+const WORKFLOW_AGENT_ACTIVE_MS = 10 * 60_000;
+const MAX_JOURNAL_BYTES = 4 * 1024 * 1024;
 const SCAN_FILE_BUDGET = 600;
 // ps reports elapsed time to the second and the scan is cached, so only treat
 // a process as newer than the transcript when it is clearly newer.
@@ -536,6 +541,55 @@ function scanLiveClaudeProcs(force) {
   return byHash;
 }
 
+// The Workflow tool returns as soon as the run is queued, so the parent's turn
+// ends and its own log goes quiet while the work continues. Its agents are the
+// only evidence, and mtime alone is not enough: they write in bursts minutes
+// apart, so a short window flickers, and a long one keeps a finished workflow
+// alive on screen.
+//
+// The journal settles it. It records `started` and `result` per agentId, so an
+// agent with no result is either working or was interrupted — and an
+// interrupted run never gets its result, leaving entries that would otherwise
+// read as running for days. Freshness of the agent's own log tells the two
+// apart.
+function hasRunningWorkflowAgent(subagentDir) {
+  const workflowRoot = path.join(subagentDir, 'workflows');
+  let entries;
+  try { entries = fs.readdirSync(workflowRoot, { withFileTypes: true }); } catch (e) { return false; }
+
+  const cutoff = Date.now() - WORKFLOW_AGENT_ACTIVE_MS;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(workflowRoot, entry.name);
+    const journal = path.join(dir, 'journal.jsonl');
+
+    let text;
+    try {
+      if (fs.statSync(journal).size > MAX_JOURNAL_BYTES) continue;
+      text = fs.readFileSync(journal, 'utf8');
+    } catch (e) { continue; }
+
+    const started = new Set();
+    const finished = new Set();
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch (e) { continue; }
+      if (!ev.agentId) continue;
+      if (ev.type === 'started') started.add(ev.agentId);
+      else if (ev.type === 'result') finished.add(ev.agentId);
+    }
+
+    for (const agentId of started) {
+      if (finished.has(agentId)) continue;
+      try {
+        if (fs.statSync(path.join(dir, 'agent-' + agentId + '.jsonl')).mtimeMs >= cutoff) return true;
+      } catch (e) { /* the agent has not written yet */ }
+    }
+  }
+  return false;
+}
+
 // sessionId -> { tty, terminal, pid, startedMs, busy, busyReason }
 //
 // A process is tied to a session by working directory, in two passes. The
@@ -566,14 +620,18 @@ function resolveLiveSessions(force) {
     // Subagents and workflow agents run in-process, so they spawn no shell —
     // their JSONL traffic is the only sign they are alive.
     const subagentDir = path.join(WATCH_DIR, s.projectHash, s.sessionId, 'subagents');
-    const busySubagents = hasRecentJsonl(subagentDir, SUBAGENT_ACTIVE_MS);
+    const busyWorkflow = hasRunningWorkflowAgent(subagentDir);
+    const busySubagents = !busyWorkflow && hasRecentJsonl(subagentDir, SUBAGENT_ACTIVE_MS);
     live.set(s.sessionId, {
       tty: proc.tty,
       terminal: proc.terminal,
       pid: Number(proc.pid),
       startedMs: proc.startedMs,
-      busy: proc.busyShell || busySubagents,
-      busyReason: proc.busyShell ? 'shell' : (busySubagents ? 'subagents' : null),
+      busy: proc.busyShell || busyWorkflow || busySubagents,
+      busyReason: busyWorkflow ? 'workflow'
+        : busySubagents ? 'subagents'
+        : proc.busyShell ? 'shell'
+        : null,
     });
     return true;
   }

@@ -64,7 +64,7 @@ Two things are read from outside those logs, because the logs do not contain the
 | Status | Meaning |
 |---|---|
 | `thinking` | The agent owes a response — a prompt to answer, a tool result to digest, a tool still running |
-| `running` | Delegated work is in flight: a shell older than 30s, or subagent traffic |
+| `running` | Delegated work is in flight: a shell older than 30s, a live workflow, or subagent traffic |
 | `waiting` | The turn is finished and the process is alive — it is blocked on you |
 | `idle` | The process is gone |
 
