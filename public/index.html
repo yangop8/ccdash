@@ -324,12 +324,18 @@
       margin-bottom: 10px;
     }
     .file-tag {
+      font-family: inherit;
       font-size: 11px;
       padding: 2px 6px;
       background: var(--bar-bg);
+      border: 1px solid transparent;
       border-radius: 3px;
       color: var(--blue);
+      cursor: pointer;
+      transition: border-color 0.15s;
     }
+    .file-tag:hover { border-color: var(--blue); }
+    .file-tag.missing { color: var(--text-dim); text-decoration: line-through; cursor: default; }
 
     /* Recent log */
     .log-toggle {
@@ -435,6 +441,26 @@
       if (pct > 80) return 'var(--red)';
       if (pct > 50) return 'var(--yellow)';
       return 'var(--blue)';
+    }
+
+    // activeFiles are absolute paths; the chip shows the basename and opens the
+    // file with whatever the desktop uses for its type.
+    function FileTag({ path }) {
+      const [missing, setMissing] = useState(false);
+      const name = path.split('/').pop() || path;
+      return e('button', {
+        className: 'file-tag' + (missing ? ' missing' : ''),
+        title: missing ? 'Gone: ' + path : path,
+        onClick: (ev) => {
+          ev.stopPropagation();
+          fetch('/api/open-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path })
+          }).then(r => { if (!r.ok) setMissing(true); })
+            .catch(() => setMissing(true));
+        }
+      }, name);
     }
 
     function ResumeButton({ session }) {
@@ -583,7 +609,7 @@
         // Active files
         session.activeFiles.length > 0
           ? e('div', { className: 'active-files' },
-              session.activeFiles.map((f, i) => e('span', { key: i, className: 'file-tag' }, f))
+              session.activeFiles.map((f, i) => e(FileTag, { key: i, path: f }))
             )
           : null,
 

@@ -139,16 +139,23 @@ function addToRecentLog(session, entry) {
   }
 }
 
+// Scratch space and background-task logs are tool plumbing, not work product:
+// /tmp/claude-<uid>/ holds task .output files and per-session scratchpads, and
+// ~/.claude is Claude Code's own state.
+const INTERNAL_PATH_RE = /^(?:\/private)?\/tmp\/claude-\d+\/|\/\.claude\//;
+
+// Full paths, so a file can actually be opened. `command` used to be read as a
+// path here, which turned any single-word shell command into a file chip.
 function extractActiveFiles(content) {
   const files = [];
   if (!Array.isArray(content)) return files;
   for (const block of content) {
-    if (block.type === 'tool_use' && block.input) {
-      const fp = block.input.file_path || block.input.path || block.input.command;
-      if (fp && typeof fp === 'string' && !fp.includes(' ')) {
-        files.push(path.basename(fp));
-      }
-    }
+    if (block.type !== 'tool_use' || !block.input) continue;
+    const fp = block.input.file_path || block.input.notebook_path || block.input.path;
+    if (!fp || typeof fp !== 'string') continue;
+    if (!path.isAbsolute(fp)) continue;
+    if (INTERNAL_PATH_RE.test(fp)) continue;
+    files.push(fp);
   }
   return files;
 }
@@ -883,6 +890,32 @@ app.post('/api/resume-session', express.json(), (req, res) => {
     if (err) return res.status(500).json({ error: 'Launch failed: ' + err.message });
     res.json({ ok: true, terminal, cwd });
   });
+});
+
+// Opening a file hands it to whatever the desktop registered for its type, so
+// refuse the extensions where that means "run this".
+const UNOPENABLE_RE = /\.(app|command|term|workflow|scpt|applescript|pkg|dmg|jar|action)$/i;
+
+app.post('/api/open-file', express.json(), (req, res) => {
+  const target = req.body && req.body.path;
+  if (!target || typeof target !== 'string' || !path.isAbsolute(target)) {
+    return res.status(400).json({ error: 'Bad path' });
+  }
+  if (UNOPENABLE_RE.test(target)) {
+    return res.status(403).json({ error: 'Refusing to launch an executable bundle' });
+  }
+  let stat;
+  try { stat = fs.statSync(target); } catch (e) { stat = null; }
+  if (!stat || !stat.isFile()) {
+    return res.status(404).json({ error: 'File is gone' });
+  }
+
+  // execFileAsync, never a shell: the path is data, not part of a command line.
+  const plat = process.platform;
+  if (plat === 'darwin') execFileAsync('open', [target], () => {});
+  else if (plat === 'win32') execFileAsync('cmd', ['/c', 'start', '', target], () => {});
+  else execFileAsync('xdg-open', [target], () => {});
+  res.json({ ok: true });
 });
 
 app.get('/api/sessions', (req, res) => {
