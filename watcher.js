@@ -161,8 +161,13 @@ function processEvent(event, projectHash) {
   if (!event.timestamp) return; // skip events without timestamps
   const ts = event.timestamp;
 
-  if (!session.startedAt) session.startedAt = ts;
-  session.lastEventAt = ts;
+  // Both must be order-independent. Files are read in whatever order the
+  // watcher reaches them, subagent logs carry the parent's sessionId, and a
+  // compaction writes events out of chronological order inside one file — so
+  // last-write-wins would let a months-old subagent event become the session's
+  // most recent activity.
+  if (!session.startedAt || ts < session.startedAt) session.startedAt = ts;
+  if (!session.lastEventAt || ts > session.lastEventAt) session.lastEventAt = ts;
   session.lastEventType = event.type;
   session.projectHash = projectHash;
 
@@ -897,6 +902,7 @@ app.get('/api/sessions', (req, res) => {
       ...session,
       status,
       live: !!info,
+      startedMs: info ? info.startedMs : null,
       contextWindow: getContextWindow(session.model, session.lastTurnInputTotal),
       seen: isSeen(session),
       busy: info ? !!info.busy : false,
@@ -935,11 +941,23 @@ app.get('/api/sessions', (req, res) => {
       s.status = 'idle-stale';
     }
   }
+  // Running sessions hold the top of the page, in the order their terminals
+  // were opened. That order does not move while they run, which matters more
+  // than sorting them by anything: these are the cards being clicked, and a
+  // list that reshuffles under the cursor every few seconds — as it would if
+  // ordered by status or by last event — is worse than one that is merely not
+  // ordered by urgency.
+  //
+  // Everything below them is ordered by how recently it was last spoken to,
+  // so picking up yesterday's work means looking at the top of that group.
   result.sort((a, b) => {
-    const aToday = a.lastEventAt && new Date(a.lastEventAt) >= todayStart ? 1 : 0;
-    const bToday = b.lastEventAt && new Date(b.lastEventAt) >= todayStart ? 1 : 0;
-    if (aToday !== bToday) return bToday - aToday; // active today first
-    return (a.label || '').localeCompare(b.label || '');
+    if (a.live !== b.live) return a.live ? -1 : 1;
+    if (a.live) {
+      const byStart = (a.startedMs || 0) - (b.startedMs || 0);
+      if (byStart) return byStart;
+      return (a.label || '').localeCompare(b.label || '');
+    }
+    return new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0);
   });
   res.json(result);
 });
