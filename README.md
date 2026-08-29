@@ -30,8 +30,8 @@ waiting for you since lunch.
 - **Context window usage** — per-model, so the bar means something
 - **Live subagent and background-job detection** — sessions doing delegated work read as
   `running` rather than idle
-- **Click a file to open it** — the files a session touched, opened with whatever the
-  desktop uses for the type
+- **Click a file to open it** — ranked so the thing you asked for comes first, opened
+  with whatever the desktop uses for the type
 - **Git branch, permission mode**, and an expandable per-session log
 
 ## Quick start

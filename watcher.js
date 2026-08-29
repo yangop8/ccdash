@@ -79,6 +79,8 @@ function getOrCreateSession(sessionId) {
       costUSD: 0,
       turnCount: 0,
       activeFiles: [],
+      fileTouches: {},   // path -> { at, produced } — ranked into activeFiles on read
+      recentPrompts: [], // lowercased human turns, for the "you asked about this" signal
       recentLog: [],
       startedAt: null,
       lastEventAt: null,
@@ -143,9 +145,78 @@ function addToRecentLog(session, entry) {
 // /tmp/claude-<uid>/ holds task .output files and per-session scratchpads, and
 // ~/.claude is Claude Code's own state.
 const INTERNAL_PATH_RE = /^(?:\/private)?\/tmp\/claude-\d+\/|\/\.claude\//;
+const PRODUCING_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'Artifact', 'MultiEdit']);
 
 // Full paths, so a file can actually be opened. `command` used to be read as a
 // path here, which turned any single-word shell command into a file chip.
+// What a deliverable looks like, in order of how much it is worth surfacing.
+const TYPE_SCORE = {
+  '.html': 6, '.pptx': 6, '.ppt': 6, '.pdf': 5, '.md': 4, '.docx': 4,
+  '.png': 2, '.jpg': 2, '.jpeg': 2, '.svg': 2, '.csv': 1, '.xlsx': 3,
+  '.py': -2, '.js': -2, '.ts': -2, '.tsx': -2, '.sh': -2, '.css': -2,
+  '.json': -2, '.yaml': -2, '.yml': -2, '.h': -3, '.cc': -3, '.cpp': -3, '.c': -3,
+};
+// An `en/` subdirectory of a delivery folder holds the English draft that still
+// has to go through translation — material, not the thing you asked for.
+//
+// A -en *sibling* directory is the opposite: a parallel English edition,
+// delivered alongside the Chinese one. Same two letters, opposite meaning, and
+// only the position in the path tells them apart.
+const INTERMEDIATE_RE = /(^|\/)en\//;
+
+function rankFiles(session, limit) {
+  const touches = session.fileTouches || {};
+  const paths = Object.keys(touches);
+  if (!paths.length) return [];
+
+  const times = paths.map(p => new Date(touches[p].at || 0).getTime());
+  const newest = Math.max(...times);
+  const oldest = Math.min(...times);
+  const span = Math.max(1, newest - oldest);
+  const prompts = session.recentPrompts || [];
+
+  const scored = paths.map(p => {
+    const touch = touches[p];
+    const base = path.basename(p);
+    const ext = path.extname(base).toLowerCase();
+    const why = [];
+    let score = 0;
+
+    const intermediate = INTERMEDIATE_RE.test(p);
+    const typeScore = TYPE_SCORE[ext];
+    if (typeof typeScore === 'number') score += typeScore;
+    // Do not call it a deliverable when the next line is about to rule that it
+    // is not one.
+    if (typeScore >= 4 && !intermediate) why.push('deliverable');
+
+    if (/^readme(\.|$)/i.test(base)) { score += 3; why.push('readme'); }
+
+    // You named it, so it is what you are waiting on. Matched on the whole
+    // filename: a bare stem like 'proposal' is an ordinary word, and matching
+    // it turns every mention of the topic into a mention of the file.
+    const named = base.toLowerCase();
+    if (named.length > 4 && prompts.some(t => t.includes(named))) {
+      score += 5;
+      why.push('you mentioned it');
+    }
+
+    if (touch.produced) { score += 2; why.push('written here'); }
+
+    if (intermediate) { score -= 5; why.push('english draft'); }
+    // A leading underscore is the usual mark for a template or reference copy.
+    if (p.split('/').some(seg => seg.startsWith('_'))) { score -= 2; why.push('supporting'); }
+
+    // Recency breaks ties without being able to outvote type on its own.
+    const age = new Date(touch.at || 0).getTime();
+    score += 1.5 * ((age - oldest) / span);
+
+    return { path: p, score, why };
+  });
+
+  scored.sort((a, b) => b.score - a.score || (b.path < a.path ? 1 : -1));
+  return scored.slice(0, limit).map(f => ({ path: f.path, why: f.why.join(' · ') }));
+}
+
 function extractActiveFiles(content) {
   const files = [];
   if (!Array.isArray(content)) return files;
@@ -210,6 +281,13 @@ function processEvent(event, projectHash) {
         : [];
       session.lastTurnHandback = kind === 'handback';
       session.lastTurnAt = ts;
+      if (event.type === 'user' && kind === 'pending' && !contentTypes.includes('tool_result')) {
+        const asked = firstText(content).toLowerCase().slice(0, 2000);
+        if (asked.trim()) {
+          session.recentPrompts.push(asked);
+          if (session.recentPrompts.length > 20) session.recentPrompts.shift();
+        }
+      }
     }
   }
 
@@ -262,11 +340,27 @@ function processEvent(event, projectHash) {
           addToRecentLog(session, { time: ts, type: 'think', msg: snippet });
         }
       }
-      // Track active files
-      const newFiles = extractActiveFiles(content);
-      if (newFiles.length) {
-        const fileSet = new Set([...newFiles, ...session.activeFiles]);
-        session.activeFiles = [...fileSet].slice(0, 10);
+      // Track active files. Which tool touched it matters: a file the session
+      // wrote is a candidate for what you asked it to make, one it only read is
+      // usually material.
+      for (const block of content) {
+        if (block.type !== 'tool_use' || !block.input) continue;
+        const fp = block.input.file_path || block.input.notebook_path || block.input.path;
+        if (!fp || typeof fp !== 'string' || !path.isAbsolute(fp)) continue;
+        if (INTERNAL_PATH_RE.test(fp)) continue;
+        const prev = session.fileTouches[fp] || { at: null, produced: false };
+        session.fileTouches[fp] = {
+          at: (!prev.at || ts > prev.at) ? ts : prev.at,
+          produced: prev.produced || PRODUCING_TOOLS.has(block.name),
+        };
+      }
+      // Keep the map from growing without bound; the ranking only needs recent work.
+      const tracked = Object.keys(session.fileTouches);
+      if (tracked.length > 200) {
+        tracked
+          .sort((a, b) => new Date(session.fileTouches[a].at || 0) - new Date(session.fileTouches[b].at || 0))
+          .slice(0, tracked.length - 200)
+          .forEach(p => { delete session.fileTouches[p]; });
       }
     }
 
@@ -931,8 +1025,10 @@ app.get('/api/sessions', (req, res) => {
     const subagentList = Object.values(session.subagents)
       .filter(s => s.status === 'thinking')
       .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0));
+    const { fileTouches, recentPrompts, ...rest } = session;
     all.push({
-      ...session,
+      ...rest,
+      activeFiles: rankFiles(session, 10),
       status,
       live: !!info,
       startedMs: info ? info.startedMs : null,

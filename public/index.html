@@ -335,6 +335,9 @@
       transition: border-color 0.15s;
     }
     .file-tag:hover { border-color: var(--blue); }
+    /* What you asked for, as opposed to what was touched getting there. */
+    .file-tag.primary { color: var(--green); background: var(--tint-green); }
+    .file-tag.primary:hover { border-color: var(--green); }
     .file-tag.missing { color: var(--text-dim); text-decoration: line-through; cursor: default; }
 
     /* Recent log */
@@ -445,12 +448,14 @@
 
     // activeFiles are absolute paths; the chip shows the basename and opens the
     // file with whatever the desktop uses for its type.
-    function FileTag({ path }) {
+    function FileTag({ file }) {
       const [missing, setMissing] = useState(false);
+      const path = file.path;
       const name = path.split('/').pop() || path;
+      const hint = file.why ? path + '\n' + file.why : path;
       return e('button', {
-        className: 'file-tag' + (missing ? ' missing' : ''),
-        title: missing ? 'Gone: ' + path : path,
+        className: 'file-tag' + (missing ? ' missing' : '') + (/deliverable|you mentioned/.test(file.why||'') ? ' primary' : ''),
+        title: missing ? 'Gone: ' + path : hint,
         onClick: (ev) => {
           ev.stopPropagation();
           fetch('/api/open-file', {
@@ -609,7 +614,7 @@
         // Active files
         session.activeFiles.length > 0
           ? e('div', { className: 'active-files' },
-              session.activeFiles.map((f, i) => e(FileTag, { key: i, path: f }))
+              session.activeFiles.map((f, i) => e(FileTag, { key: i, file: f }))
             )
           : null,
 
