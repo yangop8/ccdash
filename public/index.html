@@ -761,7 +761,8 @@
             ),
             e('span', null,
               e('span', { className: 'stat-label' }, 'Sessions'),
-              e('span', { className: 'stat-value' }, activeSessions + '/' + sessions.length)
+              e('span', { className: 'stat-value', title: sessions.length + ' sessions on disk, ' + foldedCount + ' folded away' },
+                activeSessions + '/' + (sessions.length - foldedCount))
             ),
             e('span', null,
               e('span', { className: 'stat-label' }, 'Output'),

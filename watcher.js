@@ -897,6 +897,12 @@ function openFolder(folder) {
 // Roughly where a log stops being a scratch conversation and starts being work
 // worth finding again. Ten of this machine's thirty sessions clear it.
 const SUBSTANTIAL_LOG_BYTES = 5 * 1024 * 1024;
+// A session whose working directory is a system temp folder came from a
+// harness, not from you: benchmark runs and sandboxes, in directories the OS
+// will delete on its own. They are real sessions, and there are far more of
+// them than there are of yours — 102 against 19 on this machine — so being the
+// newest of their kind is not a reason to hold a place on screen.
+const EPHEMERAL_CWD_RE = /^(?:\/private)?\/var\/folders\/|^(?:\/private)?\/tmp\//;
 const SEEN_TTL_MS = 2 * 60 * 60 * 1000;
 const seenSessions = new Map(); // sessionId -> { at, turnAt }
 
@@ -1071,9 +1077,10 @@ app.get('/api/sessions', (req, res) => {
     }
   }
   for (const s of all) {
+    const ephemeral = EPHEMERAL_CWD_RE.test(s.cwd || '');
     s.hidden = !(
       s.live ||
-      newestByLabel.get(s.label) === s ||
+      (!ephemeral && newestByLabel.get(s.label) === s) ||
       (s.logBytes || 0) >= SUBSTANTIAL_LOG_BYTES
     );
   }
