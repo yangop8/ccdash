@@ -195,6 +195,45 @@
     .status-dot.waiting.seen { background: var(--text-dim); animation: none; }
     .seen-tick { margin-right: 4px; opacity: 0.9; }
 
+    /* Header controls */
+    .header-tools { display: flex; gap: 8px; align-items: center; }
+    .search-box {
+      font-family: inherit;
+      font-size: 12px;
+      padding: 4px 8px;
+      min-width: 190px;
+      color: var(--text);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+    }
+    .search-box:focus { outline: none; border-color: var(--blue); }
+    .search-box::placeholder { color: var(--text-dim); }
+    .toggle-all {
+      font-family: inherit;
+      font-size: 11px;
+      padding: 4px 9px;
+      cursor: pointer;
+      color: var(--text-dim);
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+    .toggle-all:hover { border-color: var(--blue); color: var(--text); }
+    .toggle-all.on { color: var(--blue); border-color: var(--blue); }
+
+    /* One-line topic, straight from the session's own title */
+    .card-topic {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .card.hidden-session { border-left-style: dashed; }
+
     /* Only on sessions whose process is gone: brings the conversation back. */
     .resume-btn {
       font-family: inherit;
@@ -514,7 +553,7 @@
 
       const seen = session.seen && st === 'waiting';
 
-      return e('div', { className: 'card status-' + st + (seen ? ' seen' : '') },
+      return e('div', { className: 'card status-' + st + (seen ? ' seen' : '') + (session.hidden ? ' hidden-session' : '') },
         // Header
         e('div', { className: 'card-header' },
           e('div', null,
@@ -546,7 +585,8 @@
               session.label || session.sessionId.substring(0, 8),
               session.live ? e('span', { className: 'live-badge' }, 'LIVE') : null
             ),
-            session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null
+            session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null,
+            session.aiTitle ? e('div', { className: 'card-topic', title: session.aiTitle }, session.aiTitle) : null
           ),
           e('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
             !session.live && session.cwd
@@ -670,6 +710,20 @@
         return () => clearInterval(iv);
       }, [fetchSessions]);
 
+      const [query, setQuery] = useState('');
+      const [showAll, setShowAll] = useState(false);
+
+      const q = query.trim().toLowerCase();
+      // Search reaches the folded sessions too — that is the point of it.
+      const visible = sessions.filter(s => {
+        if (q) {
+          const hay = [s.label, s.aiTitle, s.cwd, s.gitBranch].filter(Boolean).join(' ').toLowerCase();
+          return hay.includes(q);
+        }
+        return showAll || !s.hidden;
+      });
+      const foldedCount = sessions.filter(s => s.hidden).length;
+
       const totalCost = sessions.reduce((s, x) => s + x.costUSD, 0);
       const totalOut = sessions.reduce((s, x) => s + x.tokensOut, 0);
       const activeSessions = sessions.filter(s => s.status === 'thinking' || s.status === 'waiting' || s.status === 'running').length;
@@ -682,6 +736,29 @@
             'Claude Code Dashboard'
           ),
           e('div', { className: 'header-stats' },
+            e('div', { className: 'header-tools' },
+              e('input', {
+                className: 'search-box',
+                type: 'search',
+                list: 'session-topics',
+                placeholder: 'Search sessions…',
+                value: query,
+                onChange: (ev) => setQuery(ev.target.value)
+              }),
+              // Suggestions are the session titles themselves, so typing a
+              // half-remembered topic completes to the real one.
+              e('datalist', { id: 'session-topics' },
+                [...new Set(sessions.flatMap(s => [s.aiTitle, s.label].filter(Boolean)))]
+                  .map((t, i) => e('option', { key: i, value: t }))
+              ),
+              foldedCount > 0 && !q
+                ? e('button', {
+                    className: 'toggle-all' + (showAll ? ' on' : ''),
+                    title: showAll ? 'Hide older sessions again' : foldedCount + ' older sessions are folded away',
+                    onClick: () => setShowAll(v => !v)
+                  }, showAll ? 'Hide ' + foldedCount : '+ ' + foldedCount + ' older')
+                : null
+            ),
             e('span', null,
               e('span', { className: 'stat-label' }, 'Sessions'),
               e('span', { className: 'stat-value' }, activeSessions + '/' + sessions.length)
@@ -698,13 +775,15 @@
         ),
 
         // Cards
-        sessions.length === 0
+        visible.length === 0
           ? e('div', { className: 'empty' },
-              e('h2', null, 'No sessions detected'),
-              e('p', null, 'Start a Claude Code session in any terminal to see it here.')
+              e('h2', null, q ? 'Nothing matches “' + query + '”' : 'No sessions detected'),
+              e('p', null, q
+                ? 'Searching label, topic, path and branch across all ' + sessions.length + ' sessions.'
+                : 'Start a Claude Code session in any terminal to see it here.')
             )
           : e('div', { className: 'grid' },
-              sessions.map(s => e(SessionCard, { key: s.sessionId, session: s }))
+              visible.map(s => e(SessionCard, { key: s.sessionId, session: s }))
             )
       );
     }

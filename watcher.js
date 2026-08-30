@@ -89,6 +89,7 @@ function getOrCreateSession(sessionId) {
       lastTurnType: '',        // 'user' | 'assistant' — main conversation only
       lastTurnContentTypes: [],
       lastTurnTools: [],
+      logBytes: 0,       // size of this session's own log — a proxy for how much work is in it
       lastTurnHandback: false, // true once control is back with the human
       lastTurnAt: null,
       lastTurnInputTotal: 0, // input + cache for context window estimate
@@ -236,6 +237,11 @@ function processEvent(event, projectHash) {
   if (event.type === 'file-history-snapshot' || event.type === 'queue-operation' || event.type === 'last-prompt') return;
 
   const session = getOrCreateSession(event.sessionId);
+
+  // Claude Code's own title for the conversation. It arrives on an untimestamped
+  // event, so it has to be read before the guard below drops those.
+  if (event.aiTitle) session.aiTitle = event.aiTitle;
+
   if (!event.timestamp) return; // skip events without timestamps
   const ts = event.timestamp;
 
@@ -258,7 +264,6 @@ function processEvent(event, projectHash) {
     session.gitBranch = event.gitBranch;
   }
   if (event.version) session.version = event.version;
-  if (event.aiTitle) session.aiTitle = event.aiTitle;
   if (event.permissionMode) session.permissionMode = event.permissionMode;
 
   const msg = event.message || {};
@@ -496,6 +501,10 @@ function processFile(filePath) {
         // Skip malformed lines (partial writes)
       }
     }
+    // Only the session's own log counts, not its subagents': the name of a file
+    // sitting directly in the project folder is the session id.
+    const own = sessions.get(path.basename(filePath, '.jsonl'));
+    if (own) own.logBytes = stat.size;
   });
 }
 
@@ -885,6 +894,9 @@ function openFolder(folder) {
 //
 // Deliberately in memory: the mark is worth less than its own TTL, so
 // persisting it across a watcher restart would buy nothing.
+// Roughly where a log stops being a scratch conversation and starts being work
+// worth finding again. Ten of this machine's thirty sessions clear it.
+const SUBSTANTIAL_LOG_BYTES = 5 * 1024 * 1024;
 const SEEN_TTL_MS = 2 * 60 * 60 * 1000;
 const seenSessions = new Map(); // sessionId -> { at, turnAt }
 
@@ -1044,23 +1056,36 @@ app.get('/api/sessions', (req, res) => {
     });
   }
 
-  // Active sessions (thinking/waiting/error) always shown individually.
-  // Idle sessions: only show the most recent per project label.
-  const active = all.filter(s => s.status !== 'idle');
-  const idle = all.filter(s => s.status === 'idle');
-  // Collect labels that already have an active session
-  const activeLabels = new Set(active.map(s => s.label));
-  const latestIdleByLabel = new Map();
-  for (const s of idle) {
-    // Skip idle sessions if that project already has an active session
-    if (activeLabels.has(s.label)) continue;
-    const existing = latestIdleByLabel.get(s.label);
-    if (!existing || new Date(s.lastEventAt || 0) > new Date(existing.lastEventAt || 0)) {
-      latestIdleByLabel.set(s.label, s);
+  // Everything is sent; `hidden` says what the page folds away by default, so
+  // searching and the show-all toggle need no second request.
+  //
+  // A session is kept in view when it is running, when it is the most recent
+  // one for its project, or when its log is big enough that it clearly holds
+  // real work — losing a month-long conversation behind a five-minute one in
+  // the same folder is the failure worth avoiding.
+  const newestByLabel = new Map();
+  for (const s of all) {
+    const seen = newestByLabel.get(s.label);
+    if (!seen || new Date(s.lastEventAt || 0) > new Date(seen.lastEventAt || 0)) {
+      newestByLabel.set(s.label, s);
     }
   }
+  for (const s of all) {
+    s.hidden = !(
+      s.live ||
+      newestByLabel.get(s.label) === s ||
+      (s.logBytes || 0) >= SUBSTANTIAL_LOG_BYTES
+    );
+  }
 
-  const result = [...active, ...latestIdleByLabel.values()];
+  // A folded card is not rendered until it is searched for or the toggle is
+  // flipped, and its log is 40% of the payload. Drop it for those; the title,
+  // the cost and the resume button are what make an old session findable.
+  for (const s of all) {
+    if (s.hidden) { s.recentLog = []; s.activeFiles = []; }
+  }
+
+  const result = all;
   // Sort: active today first (alphabetical), then inactive today (alphabetical)
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);

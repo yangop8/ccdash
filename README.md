@@ -32,6 +32,8 @@ waiting for you since lunch.
   `running` rather than idle
 - **Click a file to open it** — ranked so the thing you asked for comes first, opened
   with whatever the desktop uses for the type
+- **Search across every session** — by topic, project, path or branch, with the session
+  titles as autocomplete
 - **Git branch, permission mode**, and an expandable per-session log
 
 ## Quick start
