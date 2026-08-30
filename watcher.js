@@ -1078,6 +1078,9 @@ app.get('/api/sessions', (req, res) => {
   }
   for (const s of all) {
     const ephemeral = EPHEMERAL_CWD_RE.test(s.cwd || '');
+    // Carried through so search can rank these below your own work: a common
+    // word matches sixty harness runs and none of your sessions otherwise.
+    s.ephemeral = ephemeral;
     s.hidden = !(
       s.live ||
       (!ephemeral && newestByLabel.get(s.label) === s) ||

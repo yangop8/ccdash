@@ -233,6 +233,16 @@
       white-space: nowrap;
     }
     .card.hidden-session { border-left-style: dashed; }
+    .temp-badge {
+      font-size: 9px;
+      padding: 0 5px;
+      border-radius: 3px;
+      font-weight: 600;
+      letter-spacing: 0.4px;
+      color: var(--text-dim);
+      background: var(--tint-dim);
+      border: 1px solid var(--border);
+    }
 
     /* Only on sessions whose process is gone: brings the conversation back. */
     .resume-btn {
@@ -583,7 +593,8 @@
             },
               e('span', { className: 'status-dot ' + st + (seen ? ' seen' : '') }),
               session.label || session.sessionId.substring(0, 8),
-              session.live ? e('span', { className: 'live-badge' }, 'LIVE') : null
+              session.live ? e('span', { className: 'live-badge' }, 'LIVE') : null,
+              session.ephemeral ? e('span', { className: 'temp-badge', title: 'Working directory is a system temp folder — a harness run' }, 'TEMP') : null
             ),
             session.gitBranch ? e('div', { className: 'git-branch' }, session.gitBranch) : null,
             session.aiTitle ? e('div', { className: 'card-topic', title: session.aiTitle }, session.aiTitle) : null
@@ -714,14 +725,20 @@
       const [showAll, setShowAll] = useState(false);
 
       const q = query.trim().toLowerCase();
-      // Search reaches the folded sessions too — that is the point of it.
-      const visible = sessions.filter(s => {
+      // Search reaches the folded sessions too — that is the point of it. But
+      // harness runs outnumber real ones many times over, and an ordinary word
+      // matches dozens of them and none of yours, so they sink to the bottom
+      // rather than being excluded.
+      let visible = sessions.filter(s => {
         if (q) {
           const hay = [s.label, s.aiTitle, s.cwd, s.gitBranch].filter(Boolean).join(' ').toLowerCase();
           return hay.includes(q);
         }
         return showAll || !s.hidden;
       });
+      if (q) {
+        visible = [...visible.filter(s => !s.ephemeral), ...visible.filter(s => s.ephemeral)];
+      }
       const foldedCount = sessions.filter(s => s.hidden).length;
 
       const totalCost = sessions.reduce((s, x) => s + x.costUSD, 0);
