@@ -111,11 +111,21 @@ Cache tokens are billed separately: writes at 1.25x the input rate, reads at 0.1
 
 ### Auto-start
 
-A macOS LaunchAgent works, but only if the checkout lives **outside** `~/Desktop`,
-`~/Documents`, and `~/Downloads`. Those are TCC-protected, and a background agent that
-touches them blocks forever in `open()` with no error and no prompt — Node walks up the
-directory tree looking for `package.json` before it runs a line of your code, so the hang
-happens at startup.
+A macOS LaunchAgent works. `RunAtLoad` starts it at login and `KeepAlive` with
+`SuccessfulExit: false` restarts it if it dies:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.you.ccdash.plist
+launchctl kickstart -k gui/$(id -u) com.you.ccdash   # after editing watcher.js
+```
+
+**If the checkout is under `~/Desktop`, `~/Documents`, or `~/Downloads`**, the agent may
+hang at startup instead of running: those folders are TCC-protected, and Node walks up the
+directory tree looking for `package.json` before executing a line of your code. A
+background agent cannot show the permission prompt that would unblock it, so it waits in
+`open()` forever — the process is alive, at 0% CPU, with an empty log and nothing
+listening. Either keep the checkout somewhere else, or grant the node binary access to
+that folder before installing the agent.
 
 ## Tech stack
 
