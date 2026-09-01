@@ -148,8 +148,6 @@ function addToRecentLog(session, entry) {
 const INTERNAL_PATH_RE = /^(?:\/private)?\/tmp\/claude-\d+\/|\/\.claude\//;
 const PRODUCING_TOOLS = new Set(['Write', 'Edit', 'NotebookEdit', 'Artifact', 'MultiEdit']);
 
-// Full paths, so a file can actually be opened. `command` used to be read as a
-// path here, which turned any single-word shell command into a file chip.
 // What a deliverable looks like, in order of how much it is worth surfacing.
 const TYPE_SCORE = {
   '.html': 6, '.pptx': 6, '.ppt': 6, '.pdf': 5, '.md': 4, '.docx': 4,
@@ -216,20 +214,6 @@ function rankFiles(session, limit) {
 
   scored.sort((a, b) => b.score - a.score || (b.path < a.path ? 1 : -1));
   return scored.slice(0, limit).map(f => ({ path: f.path, why: f.why.join(' · ') }));
-}
-
-function extractActiveFiles(content) {
-  const files = [];
-  if (!Array.isArray(content)) return files;
-  for (const block of content) {
-    if (block.type !== 'tool_use' || !block.input) continue;
-    const fp = block.input.file_path || block.input.notebook_path || block.input.path;
-    if (!fp || typeof fp !== 'string') continue;
-    if (!path.isAbsolute(fp)) continue;
-    if (INTERNAL_PATH_RE.test(fp)) continue;
-    files.push(fp);
-  }
-  return files;
 }
 
 function processEvent(event, projectHash) {
@@ -345,9 +329,11 @@ function processEvent(event, projectHash) {
           addToRecentLog(session, { time: ts, type: 'think', msg: snippet });
         }
       }
-      // Track active files. Which tool touched it matters: a file the session
-      // wrote is a candidate for what you asked it to make, one it only read is
-      // usually material.
+      // Track active files, by full path so they can be opened. Which tool
+      // touched one matters: a file the session wrote is a candidate for what
+      // you asked it to make, one it only read is usually material. (`command`
+      // is deliberately not read as a path — it used to be, and every
+      // single-word shell command became a file chip.)
       for (const block of content) {
         if (block.type !== 'tool_use' || !block.input) continue;
         const fp = block.input.file_path || block.input.notebook_path || block.input.path;
@@ -470,11 +456,27 @@ function deriveStatus(session, liveInfo) {
 }
 
 // --- JSONL File Processing ---
+// One read per file at a time. A second change event during a read re-reads
+// from the same offset otherwise, and every event in the overlap is counted
+// twice — token dedup by message id hides that for cost but not for turns,
+// files or the log.
+const inFlight = new Map(); // path -> true when a read is in progress, 'again' when one is queued
+
 function processFile(filePath) {
+  if (inFlight.has(filePath)) { inFlight.set(filePath, 'again'); return; }
+  inFlight.set(filePath, true);
+  readFile(filePath, () => {
+    const again = inFlight.get(filePath) === 'again';
+    inFlight.delete(filePath);
+    if (again) processFile(filePath);
+  });
+}
+
+function readFile(filePath, done) {
   let stat;
-  try { stat = fs.statSync(filePath); } catch { return; }
+  try { stat = fs.statSync(filePath); } catch { return done(); }
   const offset = fileOffsets.get(filePath) || 0;
-  if (stat.size <= offset) return;
+  if (stat.size <= offset) return done();
 
   // The project folder is the first segment under the watch root. Using the
   // parent directory instead breaks on subagent logs, which sit at
@@ -489,22 +491,36 @@ function processFile(filePath) {
   let buffer = '';
 
   stream.on('data', (chunk) => { buffer += chunk; });
+  stream.on('error', () => done());
   stream.on('end', () => {
-    fileOffsets.set(filePath, stat.size);
     const lines = buffer.split('\n');
+    // A read can land mid-write, leaving the last line cut off. Advancing the
+    // offset past it would lose that event for good: the next read starts at
+    // the tail, which is not JSON either. If the last line does not parse, hold
+    // it back so the next read starts from its beginning.
+    let consumed = buffer.length;
+    const last = lines[lines.length - 1];
+    if (last.trim()) {
+      try { JSON.parse(last); } catch (e) {
+        lines.pop();
+        consumed -= last.length;
+      }
+    }
+    fileOffsets.set(filePath, offset + Buffer.byteLength(buffer.slice(0, consumed), 'utf8'));
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
         processEvent(event, projectHash);
       } catch (e) {
-        // Skip malformed lines (partial writes)
+        // Skip malformed lines
       }
     }
     // Only the session's own log counts, not its subagents': the name of a file
     // sitting directly in the project folder is the session id.
     const own = sessions.get(path.basename(filePath, '.jsonl'));
     if (own) own.logBytes = stat.size;
+    done();
   });
 }
 
@@ -629,6 +645,17 @@ function scanLiveClaudeProcs(force) {
           }
         } catch (e) { /* no lsof -> no live detection, fall back to folder */ }
 
+        // args is read per pid rather than in the bulk listing because command
+        // lines can contain newlines; a claude process's own line never does.
+        const resumeIds = new Map();
+        for (const pid of claudePids) {
+          try {
+            const args = execFileSync('ps', ['-o', 'args=', '-p', pid], { encoding: 'utf8', timeout: 2000 });
+            const m = args.match(/(?:^|\s)(?:--resume|-r)\s+([0-9a-fA-F-]{8,})/);
+            if (m && !/--fork-session/.test(args)) resumeIds.set(pid, m[1]);
+          } catch (e) { /* process gone between listing and now */ }
+        }
+
         for (const pid of claudePids) {
           const proc = procs.get(pid);
           const cwd = cwds.get(pid);
@@ -645,6 +672,7 @@ function scanLiveClaudeProcs(force) {
           if (!byHash.has(hash)) byHash.set(hash, []);
           byHash.get(hash).push({
             pid, tty, cwd, busyShell,
+            resumeId: resumeIds.get(pid) || null,
             startedMs: now - etimeSeconds(proc.etime) * 1000,
             terminal: findTerminalApp(procs, pid),
           });
@@ -716,7 +744,20 @@ function hasRunningWorkflowAgent(subagentDir) {
 //
 // One process per session either way: where several could match, the most
 // recently active takes it.
+let liveSessionsCache = { at: 0, live: new Map() };
+
 function resolveLiveSessions(force) {
+  // The process scan was cached but this was not, and this is the expensive
+  // half: every workflow journal parsed and up to 600 files stat'd per live
+  // session, on every 2-second poll.
+  const now = Date.now();
+  if (!force && now - liveSessionsCache.at < LIVE_TTL_MS) return liveSessionsCache.live;
+  const live = computeLiveSessions(force);
+  liveSessionsCache = { at: now, live };
+  return live;
+}
+
+function computeLiveSessions(force) {
   const byHash = scanLiveClaudeProcs(force);
   const live = new Map();
   if (!byHash.size) return live;
@@ -751,7 +792,14 @@ function resolveLiveSessions(force) {
     return true;
   }
 
-  const unmatched = procs.filter(proc => !claim(proc, s => s.cwd === proc.cwd));
+  // Two sessions in one folder — the old one resumed beside the new — match
+  // the same cwd, and recency alone pairs them with processes arbitrarily, so
+  // the jump can raise the wrong window. A process started with
+  // `--resume <id>` names its session outright; only `--fork-session` makes
+  // that id the parent's rather than its own.
+  const named = procs.filter(proc => proc.resumeId && !claim(proc, s => s.sessionId === proc.resumeId));
+  const rest = procs.filter(proc => !proc.resumeId).concat(named);
+  const unmatched = rest.filter(proc => !claim(proc, s => s.cwd === proc.cwd));
   for (const proc of unmatched) {
     const hash = encodeProjectHash(proc.cwd);
     claim(proc, s => s.projectHash === hash);
@@ -927,6 +975,17 @@ function isSeen(session) {
 
 // --- Express Server ---
 const app = express();
+
+// Binding to loopback keeps the LAN out; it does not stop a web page the user
+// has open from resolving its own hostname to 127.0.0.1 and calling these
+// routes as if it were same-origin. Every route here opens files or launches
+// terminals, so the Host header has to name this machine.
+const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+app.use((req, res, next) => {
+  if (LOCAL_HOST_RE.test(req.headers.host || '')) return next();
+  res.status(403).end('Local access only');
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.post('/api/open-folder', express.json(), (req, res) => {
@@ -1137,10 +1196,11 @@ app.get('/api/sessions', (req, res) => {
   }
 
   // A folded card is not rendered until it is searched for or the toggle is
-  // flipped, and its log is 40% of the payload. Drop it for those; the title,
-  // the cost and the resume button are what make an old session findable.
+  // flipped, and its log is 40% of the payload, so drop that. Its files stay:
+  // finding an old session and opening what it produced is the reason to
+  // search for it at all.
   for (const s of all) {
-    if (s.hidden) { s.recentLog = []; s.activeFiles = []; }
+    if (s.hidden) s.recentLog = [];
   }
 
   const result = all;
@@ -1176,7 +1236,7 @@ app.get('/api/sessions', (req, res) => {
 
 // --- Start ---
 const WATCH_DIR = path.join(os.homedir(), '.claude', 'projects');
-const PORT = 3001;
+const PORT = Number(process.env.PORT) || 3001;
 
 console.log(`Watching: ${WATCH_DIR}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
@@ -1197,6 +1257,17 @@ watcher.on('add', (filePath) => {
 });
 watcher.on('change', (filePath) => {
   if (shouldProcessFile(filePath)) processFile(filePath);
+});
+// A session whose log is deleted should leave the page, not linger until the
+// next restart. Only a top-level log names a session; a subagent file going
+// away changes nothing about its parent.
+watcher.on('unlink', (filePath) => {
+  fileOffsets.delete(filePath);
+  if (path.dirname(path.dirname(filePath)) !== WATCH_DIR) return;
+  const id = path.basename(filePath, '.jsonl');
+  sessions.delete(id);
+  seenMessageIds.delete(id);
+  seenSessions.delete(id);
 });
 
 // Loopback only. Without a host argument this binds every interface, which put
