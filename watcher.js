@@ -1008,6 +1008,54 @@ app.post('/api/resume-session', express.json(), (req, res) => {
 // refuse the extensions where that means "run this".
 const UNOPENABLE_RE = /\.(app|command|term|workflow|scpt|applescript|pkg|dmg|jar|action)$/i;
 
+// Serving a file over HTTP rather than handing it to `open` is what fixes the
+// mojibake: a browser opening file:// has nothing to go on but the page's own
+// <meta charset>, and half of these deliverables do not declare one, so a
+// UTF-8 page gets guessed as the system's legacy encoding. A Content-Type
+// header settles it from the outside.
+//
+// The URL mirrors the filesystem path, so a relative <img src="x.png"> inside
+// the page resolves to the neighbouring file the way it does on disk.
+const SERVE_TYPES = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
+  '.md': 'text/plain; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
+// Nothing here needs to reach a credential store to render a page.
+const PRIVATE_DIR_RE = /\/\.(ssh|aws|gnupg|kube|docker|config|netrc|password-store)(\/|$)/i;
+
+app.use('/file', (req, res) => {
+  let target;
+  try { target = decodeURIComponent(req.path); } catch (e) { return res.status(400).end('Bad path'); }
+  if (!path.isAbsolute(target) || target.includes('\0')) return res.status(400).end('Bad path');
+  target = path.normalize(target);
+  if (PRIVATE_DIR_RE.test(target)) return res.status(403).end('Refused');
+
+  const type = SERVE_TYPES[path.extname(target).toLowerCase()];
+  if (!type) return res.status(415).end('Not a viewable file');
+
+  let stat;
+  try { stat = fs.statSync(target); } catch (e) { stat = null; }
+  if (!stat || !stat.isFile()) return res.status(404).end('Not found');
+
+  res.setHeader('Content-Type', type);
+  res.setHeader('Content-Length', stat.size);
+  fs.createReadStream(target).on('error', () => res.destroy()).pipe(res);
+});
+
 app.post('/api/open-file', express.json(), (req, res) => {
   const target = req.body && req.body.path;
   if (!target || typeof target !== 'string' || !path.isAbsolute(target)) {
@@ -1151,7 +1199,9 @@ watcher.on('change', (filePath) => {
   if (shouldProcessFile(filePath)) processFile(filePath);
 });
 
-const server = app.listen(PORT, () => {
+// Loopback only. Without a host argument this binds every interface, which put
+// the dashboard — and now a file-serving route — on the local network.
+const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
 server.on('error', (err) => {

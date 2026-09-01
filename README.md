@@ -30,8 +30,9 @@ waiting for you since lunch.
 - **Context window usage** — per-model, so the bar means something
 - **Live subagent and background-job detection** — sessions doing delegated work read as
   `running` rather than idle
-- **Click a file to open it** — ranked so the thing you asked for comes first, opened
-  with whatever the desktop uses for the type
+- **Click a file to open it** — ranked so the thing you asked for comes first. HTML is
+  served by the dashboard with an explicit charset; everything else opens in whatever
+  app owns the type
 - **Search across every session** — by topic, project, path or branch, with the session
   titles as autocomplete
 - **Git branch, permission mode**, and an expandable per-session log

@@ -507,6 +507,14 @@
         title: missing ? 'Gone: ' + path : hint,
         onClick: (ev) => {
           ev.stopPropagation();
+          // HTML goes through the dashboard so the response carries a charset;
+          // opening it as file:// leaves the browser guessing, and a page with
+          // no <meta charset> of its own comes out as mojibake. Everything else
+          // is better off in whatever app owns the type.
+          if (/\.html?$/i.test(path)) {
+            window.open('/file' + path.split('/').map(encodeURIComponent).join('/'), '_blank');
+            return;
+          }
           fetch('/api/open-file', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
