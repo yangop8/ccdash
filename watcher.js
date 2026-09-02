@@ -365,14 +365,13 @@ function processEvent(event, projectHash) {
   if (event.agentId && !event.agentId.startsWith('acompact')) {
     const aid = event.agentId;
     if (!session.subagents[aid]) {
-      session.subagents[aid] = { agentId: aid, task: '', status: 'idle', tokensOut: 0, lastEventAt: null };
+      session.subagents[aid] = { agentId: aid, task: '', tokensOut: 0, lastEventAt: null };
     }
     const sub = session.subagents[aid];
-    sub.lastEventAt = ts;
-
-    // Derive subagent status
-    const subElapsed = Date.now() - new Date(ts).getTime();
-    sub.status = subElapsed < 15_000 ? 'thinking' : 'idle';
+    // Only ever moves forward: subagent logs are read in whatever order the
+    // watcher reaches them, and whether one is still working is decided at
+    // read time, not here.
+    if (!sub.lastEventAt || ts > sub.lastEventAt) sub.lastEventAt = ts;
 
     // Capture task from first user message
     if (!sub.task && event.type === 'user' && msg.role === 'user') {
@@ -1146,10 +1145,18 @@ app.get('/api/sessions', (req, res) => {
   for (const session of sessions.values()) {
     const info = live.get(session.sessionId);
     const status = deriveStatus(session, info);
-    // Convert subagents object to sorted array, only include active ones
+    // Whether a subagent is still working has to be decided here, on every
+    // read. Deciding it once while parsing froze the answer: a subagent was
+    // marked 'thinking' at the moment its last event was read, then finished
+    // and wrote nothing more, so nothing ever revisited the verdict and it sat
+    // in this list for hours. Only sessions live while the watcher ran
+    // collected these — a restart re-reads the same events with old timestamps
+    // and correctly calls them idle, which is what made it intermittent.
+    const subCutoff = Date.now() - SUBAGENT_ACTIVE_MS;
     const subagentList = Object.values(session.subagents)
-      .filter(s => s.status === 'thinking')
-      .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0));
+      .filter(s => s.lastEventAt && new Date(s.lastEventAt).getTime() >= subCutoff)
+      .sort((a, b) => new Date(b.lastEventAt || 0) - new Date(a.lastEventAt || 0))
+      .map(s => ({ ...s, status: 'thinking' }));
     const { fileTouches, recentPrompts, ...rest } = session;
     all.push({
       ...rest,
