@@ -1118,8 +1118,54 @@ const SERVE_TYPES = {
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
 };
-// Nothing here needs to reach a credential store to render a page.
-const PRIVATE_DIR_RE = /\/\.(ssh|aws|gnupg|kube|docker|config|netrc|password-store)(\/|$)/i;
+// Kept as a second line only. A denylist cannot be the rule here: it answers
+// "is this one of the places I thought of", and the interesting file is always
+// somewhere nobody thought of — ~/.claude was not on this list until a review
+// asked for credentials.json and got it.
+const PRIVATE_DIR_RE = /\/\.(ssh|aws|gnupg|kube|docker|config|netrc|password-store|claude|gnupg)(\/|$)/i;
+
+// The rule is an allowlist, and the dashboard already knows what belongs on
+// it: the directories holding files some session actually touched. That is
+// exactly the set of things a chip can point at, plus the assets a page
+// alongside them loads. Everything else on the disk — other projects, config,
+// credentials — is not reachable from a preview at all.
+//
+// Roots are resolved through symlinks and cached briefly, since a request for
+// a page pulls its images and stylesheets in behind it.
+// A root has to be a directory that belongs to the work, not one that merely
+// contains it. Shared parents are refused outright: a session that once wrote
+// /tmp/scratch.md would otherwise make /tmp a root and hand every preview the
+// whole of it — which is exactly what happened, and what a review caught.
+const SHARED_PARENTS = new Set(
+  ['/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/', '/Users', '/home', '/opt', '/usr', '/etc', '/var']
+    .concat(process.env.HOME ? [process.env.HOME] : [])
+);
+const PREVIEW_ROOTS_TTL_MS = 10_000;
+let previewRootsCache = { at: 0, roots: [] };
+
+function previewRoots() {
+  const now = Date.now();
+  if (now - previewRootsCache.at < PREVIEW_ROOTS_TTL_MS) return previewRootsCache.roots;
+
+  const dirs = new Set();
+  for (const session of sessions.values()) {
+    for (const p of Object.keys(session.fileTouches || {})) dirs.add(path.dirname(p));
+  }
+  const roots = [];
+  for (const dir of dirs) {
+    if (PRIVATE_DIR_RE.test(dir)) continue;
+    let real;
+    try { real = fs.realpathSync(dir); } catch (e) { continue; }
+    if (SHARED_PARENTS.has(real)) continue;
+    roots.push(real);
+  }
+  previewRootsCache = { at: now, roots };
+  return roots;
+}
+
+function isUnderPreviewRoot(real) {
+  return previewRoots().some(root => real === root || real.startsWith(root + path.sep));
+}
 
 function serveFile(req, res) {
   let target;
@@ -1129,12 +1175,14 @@ function serveFile(req, res) {
   const type = SERVE_TYPES[path.extname(target).toLowerCase()];
   if (!type) return res.status(415).end('Not a viewable file');
 
-  // Judge the real path, not the one asked for. A symlink whose own name says
-  // nothing suspicious can point straight into ~/.ssh, and a string test on
-  // the request happily allows it.
+  // Judge the real path, not the one asked for, on both sides of the
+  // comparison. A symlink whose own name says nothing suspicious can point
+  // straight out of the allowed tree, and a string test on the request happily
+  // allows it.
   let real;
   try { real = fs.realpathSync(target); } catch (e) { return res.status(404).end('Not found'); }
   if (PRIVATE_DIR_RE.test(real)) return res.status(403).end('Refused');
+  if (!isUnderPreviewRoot(real)) return res.status(403).end('Outside the previewable directories');
 
   let stat;
   try { stat = fs.statSync(real); } catch (e) { stat = null; }

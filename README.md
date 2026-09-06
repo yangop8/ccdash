@@ -49,7 +49,10 @@ npm start
 Open **http://localhost:3001**. Run it in its own terminal tab; your Claude Code sessions
 run wherever they normally do.
 
-A second port, 3002 by default, serves HTML previews. It is a separate origin on purpose:
+A second port, 3002 by default, serves HTML previews. It serves only the directories
+holding files a session actually touched, and resolves symlinks on both sides before
+comparing, so a preview cannot read the rest of the disk. It is also a separate origin on
+purpose:
 a deliverable is HTML a session wrote, and from the dashboard's own origin its scripts could read the
 session API or trigger a resume as if they were the page itself.
 
