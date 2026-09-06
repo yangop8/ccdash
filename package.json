@@ -24,5 +24,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/yangop8/ccdash.git"
+  },
+  "engines": {
+    "node": ">=20.19.0"
   }
 }

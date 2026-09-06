@@ -49,6 +49,10 @@ npm start
 Open **http://localhost:3001**. Run it in its own terminal tab; your Claude Code sessions
 run wherever they normally do.
 
+A second port, 3002 by default, serves HTML previews. It is a separate origin on purpose:
+a deliverable is HTML a session wrote, and from the dashboard's own origin its scripts could read the
+session API or trigger a resume as if they were the page itself.
+
 ## How it works
 
 Claude Code writes JSONL session logs to `~/.claude/projects/`. ccdash watches them with
@@ -89,7 +93,7 @@ awaiting an answer.
 
 ## Requirements
 
-- **Node.js** v18+
+- **Node.js** v20.19+ (what chokidar 5 requires)
 - **Claude Code**
 - **macOS** for the click-to-jump feature (iTerm2 or Terminal). Everything else is
   cross-platform; on other terminals and platforms a click opens the session folder.

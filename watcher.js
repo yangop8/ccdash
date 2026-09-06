@@ -93,6 +93,7 @@ function getOrCreateSession(sessionId) {
       lastTurnHandback: false, // true once control is back with the human
       lastTurnAt: null,
       lastTurnInputTotal: 0, // input + cache for context window estimate
+      usageByModel: {},      // model -> {in,out,cacheCreate,cacheRead}, so cost survives a model switch
       permissionMode: '',
       version: '',
       aiTitle: '',
@@ -285,7 +286,10 @@ function processEvent(event, projectHash) {
     const usage = msg.usage;
     const seen = seenMessageIds.get(event.sessionId);
 
-    if (msg.model) session.model = msg.model;
+    // The session's model is the one *it* is running. A subagent shares the
+    // parent's sessionId, so without this guard a Haiku subagent renames an
+    // Opus session — and takes the context bar down with it.
+    if (msg.model && !event.isSidechain) session.model = msg.model;
 
     // Track per-message-id usage, only count the delta
     const prev = seen.get(msgId) || { in: 0, out: 0, cacheCreate: 0, cacheRead: 0 };
@@ -304,16 +308,35 @@ function processEvent(event, projectHash) {
 
     seen.set(msgId, curr);
 
-    // Track last turn's total input for context window estimate
-    session.lastTurnInputTotal = curr.in + curr.cacheCreate + curr.cacheRead;
+    // Context is the main thread's. A subagent's window is its own, and it is
+    // typically a fraction of the parent's — letting it through drops the bar
+    // from half full to nothing.
+    if (!event.isSidechain) {
+      session.lastTurnInputTotal = curr.in + curr.cacheCreate + curr.cacheRead;
+    }
 
-    // Recalculate cost
-    const pricing = getPricing(session.model);
-    session.costUSD =
-      (session.tokensIn * pricing.input / 1_000_000) +
-      (session.tokensOut * pricing.output / 1_000_000) +
-      (session.cacheCreationIn * pricing.input * CACHE_WRITE_MULTIPLIER / 1_000_000) +
-      (session.cacheReadIn * pricing.input * CACHE_READ_MULTIPLIER / 1_000_000);
+    // Cost is accumulated per model, then summed. Pricing the running total at
+    // whichever model spoke last means a switch silently reprices everything
+    // that came before it: a session that spent 1M input tokens on Opus and 1M
+    // on Haiku bills as $2 instead of $6. Subagent tokens count — they are
+    // real spend — at their own model's rate rather than the parent's.
+    const usedModel = msg.model || session.model || 'unknown';
+    const bucket = session.usageByModel[usedModel] ||
+      (session.usageByModel[usedModel] = { in: 0, out: 0, cacheCreate: 0, cacheRead: 0 });
+    bucket.in += Math.max(0, curr.in - prev.in);
+    bucket.out += Math.max(0, curr.out - prev.out);
+    bucket.cacheCreate += Math.max(0, curr.cacheCreate - prev.cacheCreate);
+    bucket.cacheRead += Math.max(0, curr.cacheRead - prev.cacheRead);
+
+    session.costUSD = 0;
+    for (const [model, u] of Object.entries(session.usageByModel)) {
+      const pricing = getPricing(model);
+      session.costUSD +=
+        (u.in * pricing.input / 1_000_000) +
+        (u.out * pricing.output / 1_000_000) +
+        (u.cacheCreate * pricing.input * CACHE_WRITE_MULTIPLIER / 1_000_000) +
+        (u.cacheRead * pricing.input * CACHE_READ_MULTIPLIER / 1_000_000);
+    }
 
     // Log tool use
     if (Array.isArray(content)) {
@@ -531,7 +554,9 @@ function readFile(filePath, done) {
 // reliable liveness signal (the /tmp session dirs persist long after exit).
 const { execFileSync, execFile: execFileAsync } = require('child_process');
 
-const TTY_PATH_RE = /^\/dev\/ttys[0-9]+$/;
+// macOS names them ttysNNN, Linux pts/N. Rejecting the latter made every
+// running session on Linux read as offline.
+const TTY_PATH_RE = /^\/dev\/(ttys[0-9]+|pts\/[0-9]+)$/;
 const SESSION_ID_RE = /^[0-9a-fA-F][0-9a-fA-F-]{7,63}$/;
 
 const TERMINAL_MATCHERS = [
@@ -980,10 +1005,11 @@ const app = express();
 // routes as if it were same-origin. Every route here opens files or launches
 // terminals, so the Host header has to name this machine.
 const LOCAL_HOST_RE = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
-app.use((req, res, next) => {
+function hostCheck(req, res, next) {
   if (LOCAL_HOST_RE.test(req.headers.host || '')) return next();
   res.status(403).end('Local access only');
-});
+}
+app.use(hostCheck);
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -1095,25 +1121,32 @@ const SERVE_TYPES = {
 // Nothing here needs to reach a credential store to render a page.
 const PRIVATE_DIR_RE = /\/\.(ssh|aws|gnupg|kube|docker|config|netrc|password-store)(\/|$)/i;
 
-app.use('/file', (req, res) => {
+function serveFile(req, res) {
   let target;
   try { target = decodeURIComponent(req.path); } catch (e) { return res.status(400).end('Bad path'); }
   if (!path.isAbsolute(target) || target.includes('\0')) return res.status(400).end('Bad path');
-  target = path.normalize(target);
-  if (PRIVATE_DIR_RE.test(target)) return res.status(403).end('Refused');
 
   const type = SERVE_TYPES[path.extname(target).toLowerCase()];
   if (!type) return res.status(415).end('Not a viewable file');
 
+  // Judge the real path, not the one asked for. A symlink whose own name says
+  // nothing suspicious can point straight into ~/.ssh, and a string test on
+  // the request happily allows it.
+  let real;
+  try { real = fs.realpathSync(target); } catch (e) { return res.status(404).end('Not found'); }
+  if (PRIVATE_DIR_RE.test(real)) return res.status(403).end('Refused');
+
   let stat;
-  try { stat = fs.statSync(target); } catch (e) { stat = null; }
+  try { stat = fs.statSync(real); } catch (e) { stat = null; }
   if (!stat || !stat.isFile()) return res.status(404).end('Not found');
 
   res.setHeader('Content-Type', type);
   res.setHeader('Content-Length', stat.size);
-  fs.createReadStream(target).on('error', () => res.destroy()).pipe(res);
-});
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  fs.createReadStream(real).on('error', () => res.destroy()).pipe(res);
+}
 
+// Note: /file is deliberately not mounted here — see fileApp below.
 app.post('/api/open-file', express.json(), (req, res) => {
   const target = req.body && req.body.path;
   if (!target || typeof target !== 'string' || !path.isAbsolute(target)) {
@@ -1134,6 +1167,10 @@ app.post('/api/open-file', express.json(), (req, res) => {
   else if (plat === 'win32') execFileAsync('cmd', ['/c', 'start', '', target], () => {});
   else execFileAsync('xdg-open', [target], () => {});
   res.json({ ok: true });
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({ filePort: FILE_PORT });
 });
 
 app.get('/api/sessions', (req, res) => {
@@ -1202,14 +1239,6 @@ app.get('/api/sessions', (req, res) => {
     );
   }
 
-  // A folded card is not rendered until it is searched for or the toggle is
-  // flipped, and its log is 40% of the payload, so drop that. Its files stay:
-  // finding an old session and opening what it produced is the reason to
-  // search for it at all.
-  for (const s of all) {
-    if (s.hidden) s.recentLog = [];
-  }
-
   const result = all;
   // Sort: active today first (alphabetical), then inactive today (alphabetical)
   const todayStart = new Date();
@@ -1244,6 +1273,7 @@ app.get('/api/sessions', (req, res) => {
 // --- Start ---
 const WATCH_DIR = path.join(os.homedir(), '.claude', 'projects');
 const PORT = Number(process.env.PORT) || 3001;
+const FILE_PORT = PORT + 1;
 
 console.log(`Watching: ${WATCH_DIR}`);
 console.log(`Dashboard: http://localhost:${PORT}`);
@@ -1277,15 +1307,32 @@ watcher.on('unlink', (filePath) => {
   seenSessions.delete(id);
 });
 
+// Previews get their own origin, on their own port.
+//
+// A deliverable opened from here is HTML the session wrote, and served from
+// the dashboard's origin its scripts could read /api/sessions or POST to
+// /api/resume-session as if they were the page itself. A CSP sandbox would
+// also cut that off, but by putting the page in an opaque origin — which
+// breaks localStorage, and nearly a quarter of these deliverables use it.
+// A separate port costs one listener and leaves the pages working.
+const fileApp = express();
+fileApp.use(hostCheck);
+fileApp.use('/file', serveFile);
+
 // Loopback only. Without a host argument this binds every interface, which put
-// the dashboard — and now a file-serving route — on the local network.
+// the dashboard — and the file server — on the local network.
 const server = app.listen(PORT, '127.0.0.1', () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} already in use. Kill the existing process or use a different port.`);
-    process.exit(1);
-  }
-  throw err;
+const fileServer = fileApp.listen(FILE_PORT, '127.0.0.1', () => {
+  console.log(`File previews on http://localhost:${FILE_PORT}`);
 });
+for (const [s, p, what] of [[server, PORT, 'Dashboard'], [fileServer, FILE_PORT, 'File preview']]) {
+  s.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`${what} port ${p} already in use. Kill the existing process or set PORT.`);
+      process.exit(1);
+    }
+    throw err;
+  });
+}

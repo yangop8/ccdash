@@ -495,6 +495,13 @@
       return 'var(--blue)';
     }
 
+    // Previews are served from their own port so a deliverable's scripts cannot
+    // reach the dashboard's API as same-origin. Until that port is known, a
+    // click falls through to opening the file in a desktop app, which is
+    // correct if less convenient.
+    let filePort = null;
+    fetch('/api/config').then(r => r.json()).then(c => { filePort = c.filePort; }).catch(() => {});
+
     // activeFiles are absolute paths; the chip shows the basename and opens the
     // file with whatever the desktop uses for its type.
     function FileTag({ file }) {
@@ -511,8 +518,10 @@
           // opening it as file:// leaves the browser guessing, and a page with
           // no <meta charset> of its own comes out as mojibake. Everything else
           // is better off in whatever app owns the type.
-          if (/\.html?$/i.test(path)) {
-            window.open('/file' + path.split('/').map(encodeURIComponent).join('/'), '_blank');
+          if (/\.html?$/i.test(path) && filePort) {
+            const url = 'http://' + location.hostname + ':' + filePort +
+              '/file' + path.split('/').map(encodeURIComponent).join('/');
+            window.open(url, '_blank');
             return;
           }
           fetch('/api/open-file', {
