@@ -359,7 +359,11 @@ function processEvent(event, projectHash) {
       // single-word shell command became a file chip.)
       for (const block of content) {
         if (block.type !== 'tool_use' || !block.input) continue;
-        const fp = block.input.file_path || block.input.notebook_path || block.input.path;
+        // Only parameters that name a file. Glob and Grep take `path` as a
+        // directory to search under; treating it as a file and taking its
+        // dirname authorised that directory's *parent*, and with it every
+        // sibling project.
+        const fp = block.input.file_path || block.input.notebook_path;
         if (!fp || typeof fp !== 'string' || !path.isAbsolute(fp)) continue;
         if (INTERNAL_PATH_RE.test(fp)) continue;
         const prev = session.fileTouches[fp] || { at: null, produced: false };
@@ -1137,34 +1141,60 @@ const PRIVATE_DIR_RE = /\/\.(ssh|aws|gnupg|kube|docker|config|netrc|password-sto
 // /tmp/scratch.md would otherwise make /tmp a root and hand every preview the
 // whole of it — which is exactly what happened, and what a review caught.
 const SHARED_PARENTS = new Set(
-  ['/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/', '/Users', '/home', '/opt', '/usr', '/etc', '/var']
+  ['/tmp', '/var/tmp', '/', '/Users', '/home', '/opt', '/usr', '/etc', '/var', '/private']
     .concat(process.env.HOME ? [process.env.HOME] : [])
+    // Resolved, because the roots they are compared against are resolved: on
+    // macOS /var is /private/var, and a set holding only the unresolved spelling
+    // never matches.
+    .flatMap(p => { try { return [p, fs.realpathSync(p)]; } catch (e) { return [p]; } })
 );
 const PREVIEW_ROOTS_TTL_MS = 10_000;
-let previewRootsCache = { at: 0, roots: [] };
+let previewRootsCache = { at: 0, roots: [], files: new Set() };
 
-function previewRoots() {
-  const now = Date.now();
-  if (now - previewRootsCache.at < PREVIEW_ROOTS_TTL_MS) return previewRootsCache.roots;
-
+// Two grants, and the difference between them is the whole point.
+//
+// A directory is opened only by *producing* something in it — Write, Edit,
+// Artifact. That is a deliverable, and a page needs its neighbours to render.
+//
+// Reading a file grants nothing but that file. A session that read
+// ~/.codex/config.toml must not thereby hand out auth.json beside it, and
+// before this it did.
+function computePreviewGrants() {
   const dirs = new Set();
+  const files = new Set();
   for (const session of sessions.values()) {
-    for (const p of Object.keys(session.fileTouches || {})) dirs.add(path.dirname(p));
+    for (const [p, touch] of Object.entries(session.fileTouches || {})) {
+      if (PRIVATE_DIR_RE.test(p)) continue;
+      let realFile;
+      try { realFile = fs.realpathSync(p); } catch (e) { continue; }
+      files.add(realFile);
+      if (!touch.produced) continue;
+      const dir = path.dirname(realFile);
+      if (PRIVATE_DIR_RE.test(dir) || SHARED_PARENTS.has(dir)) continue;
+      dirs.add(dir);
+    }
   }
-  const roots = [];
-  for (const dir of dirs) {
-    if (PRIVATE_DIR_RE.test(dir)) continue;
-    let real;
-    try { real = fs.realpathSync(dir); } catch (e) { continue; }
-    if (SHARED_PARENTS.has(real)) continue;
-    roots.push(real);
-  }
-  previewRootsCache = { at: now, roots };
-  return roots;
+  return { roots: [...dirs], files };
 }
 
+function previewGrants(force) {
+  const now = Date.now();
+  if (!force && now - previewRootsCache.at < PREVIEW_ROOTS_TTL_MS) return previewRootsCache;
+  previewRootsCache = { at: now, ...computePreviewGrants() };
+  return previewRootsCache;
+}
+
+function allowedByGrants(real, grants) {
+  if (grants.files.has(real)) return true;
+  return grants.roots.some(root => real === root || real.startsWith(root + path.sep));
+}
+
+// A file written seconds ago is the one most likely to be clicked, and its
+// directory may not be in the cache yet. Recompute once before refusing rather
+// than making the first click fail for ten seconds.
 function isUnderPreviewRoot(real) {
-  return previewRoots().some(root => real === root || real.startsWith(root + path.sep));
+  if (allowedByGrants(real, previewGrants(false))) return true;
+  return allowedByGrants(real, previewGrants(true));
 }
 
 function serveFile(req, res) {
