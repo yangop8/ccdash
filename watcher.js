@@ -1153,12 +1153,15 @@ let previewRootsCache = { at: 0, roots: [], files: new Set() };
 
 // Two grants, and the difference between them is the whole point.
 //
-// A directory is opened only by *producing* something in it — Write, Edit,
-// Artifact. That is a deliverable, and a page needs its neighbours to render.
+// Only one thing needs a *directory*: a page that pulls in the stylesheet and
+// images sitting beside it. Nothing else served here loads sub-resources — a
+// .md goes out as text, a .pdf and a .png stand alone — so producing an HTML
+// file is the only act that opens its folder.
 //
-// Reading a file grants nothing but that file. A session that read
-// ~/.codex/config.toml must not thereby hand out auth.json beside it, and
-// before this it did.
+// Everything else, produced or read, grants exactly itself. Editing
+// ~/.codex/config.toml is production too, and it must not hand out auth.json
+// beside it; before this it did.
+const PAGE_EXT_RE = /\.html?$/i;
 function computePreviewGrants() {
   const dirs = new Set();
   const files = new Set();
@@ -1168,7 +1171,7 @@ function computePreviewGrants() {
       let realFile;
       try { realFile = fs.realpathSync(p); } catch (e) { continue; }
       files.add(realFile);
-      if (!touch.produced) continue;
+      if (!touch.produced || !PAGE_EXT_RE.test(realFile)) continue;
       const dir = path.dirname(realFile);
       if (PRIVATE_DIR_RE.test(dir) || SHARED_PARENTS.has(dir)) continue;
       dirs.add(dir);

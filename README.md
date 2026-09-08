@@ -50,8 +50,9 @@ Open **http://localhost:3001**. Run it in its own terminal tab; your Claude Code
 run wherever they normally do.
 
 A second port, 3002 by default, serves HTML previews. A directory is readable only when a
-session *produced* something in it, so a page can load the assets beside it; a file that was
-merely read is readable on its own and grants nothing to its neighbours. Symlinks resolve on
+session produced an *HTML file* in it, since a page is the one thing that loads the assets
+beside it; every other file, produced or read, is readable on its own and grants nothing to
+its neighbours. Symlinks resolve on
 both sides before comparing, so a preview cannot reach the rest of the disk. It is also a separate origin on
 purpose:
 a deliverable is HTML a session wrote, and from the dashboard's own origin its scripts could read the
